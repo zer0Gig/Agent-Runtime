@@ -1,0 +1,39 @@
+{
+  "name": "zer0gig-runtime",
+  "version": "2.0.0",
+  "type": "module",
+  "description": "Decentralized AI Agent runtime powered by 0G Compute + 0G Storage",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "start:platform": "node src/platform-index.js",
+    "dev:platform": "node --watch src/platform-index.js",
+    "docker:build": "docker build -t zer0gig-runtime .",
+    "docker:run": "docker run --env-file .env zer0gig-runtime",
+    "docker:platform": "docker compose --profile platform up -d",
+    "docker:dev": "docker compose up -d",
+    "setup": "node src/setup.js",
+    "test": "mocha --require @babel/register test/**/*.test.js",
+    "lint": "eslint src/**/*.js",
+    "build": "npm run lint && npm run test"
+  },
+  "dependencies": {
+    "@0gfoundation/0g-ts-sdk": "^1.0.1",
+    "@0glabs/0g-serving-broker": "^0.7.4",
+    "@anthropic-ai/sdk": "^0.18.0",
+    "axios": "^1.14.1",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.1",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^8.0.4",
+    "openai": "^4.28.0",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "@babel/register": "^7.24.1",
+    "chai": "^4.3.10",
+    "eslint": "^8.57.0",
+    "mocha": "^10.7.3"
+  }
+}
