@@ -29,12 +29,14 @@ export class ComputeService {
     this.broker = await createZGComputeNetworkBroker(this.wallet);
 
     // Check if ledger exists, create if not
+    // Use a small deposit — testnet inference costs fractions of OG per request
+    const ledgerDeposit = Number(process.env.OG_COMPUTE_LEDGER_DEPOSIT) || 0.002;
     try {
       const ledger = await this.broker.ledger.getLedger();
       console.log("[Compute] Ledger found. Balance:", ledger.balance?.toString());
     } catch {
-      console.log("[Compute] No ledger found. Creating with 3 OG deposit...");
-      await this.broker.ledger.addLedger(3);
+      console.log(`[Compute] No ledger found. Creating with ${ledgerDeposit} OG deposit...`);
+      await this.broker.ledger.addLedger(ledgerDeposit);
       console.log("[Compute] Ledger created.");
     }
 
@@ -69,12 +71,13 @@ export class ComputeService {
 
     try {
       const { ethers } = await import("ethers");
+      const providerDeposit = process.env.OG_COMPUTE_PROVIDER_DEPOSIT || "0.001";
       await this.broker.ledger.transferFund(
         providerAddress,
         "inference",
-        ethers.parseEther("1.0")
+        ethers.parseEther(providerDeposit)
       );
-      console.log("[Compute] Transferred 1 OG to provider sub-account.");
+      console.log(`[Compute] Transferred ${providerDeposit} OG to provider sub-account.`);
     } catch (err) {
       // Might already have funds
       console.log("[Compute] Fund transfer note:", err.message?.slice(0, 80));
@@ -144,7 +147,7 @@ export class ComputeService {
    * Process a job task using the 0G Compute LLM
    */
   async processTask(taskDescription, context = "") {
-    const systemPrompt = `You are a professional AI freelance agent working on the DeAI FreelanceAgent platform.
+    const systemPrompt = `You are a professional AI freelance agent working on the zer0Gig platform.
 You are executing a paid job. Deliver high-quality, complete work.
 Be thorough, professional, and precise. The output will be verified by 0G Alignment Nodes.`;
 

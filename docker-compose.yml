@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  # ── Path A: Self-Hosted Agent (Default) ───────────────────────
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zer0gig-agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+    volumes:
+      - agent-data:/app/data
+    # For Path A, the default CMD "npm start" is used
+
+  # ── Path B: Platform Dispatcher ───────────────────────────────
+  platform:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zer0gig-platform
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - PLATFORM_MODE=true
+    command: npm run start:platform
+    volumes:
+      - platform-data:/app/data
+    profiles:
+      - platform
+
+volumes:
+  agent-data:
+  platform-data:

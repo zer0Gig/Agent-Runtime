@@ -21,6 +21,9 @@ export class StorageService {
     this.indexer = new Indexer(INDEXER_RPC);
     this.tmpDir = join(process.cwd(), ".tmp");
 
+    // NEW-2 FIX: In-memory KV index for demo (survives within process lifetime)
+    this._kvIndex = new Map();
+
     if (!existsSync(this.tmpDir)) {
       mkdirSync(this.tmpDir, { recursive: true });
     }
@@ -70,6 +73,17 @@ export class StorageService {
    * Download data from 0G Storage by root hash
    */
   async downloadData(rootHash, filename = "download.json") {
+    // Inline-encoded brief (txt:base64) — decode directly, no network call needed
+    if (rootHash && rootHash.startsWith("txt:")) {
+      console.log(`[Storage] Decoding inline txt brief...`);
+      const text = Buffer.from(rootHash.slice(4), "base64").toString("utf-8");
+      try {
+        return JSON.parse(text);
+      } catch {
+        return { task: text };
+      }
+    }
+
     const outputPath = join(this.tmpDir, filename);
 
     console.log(`[Storage] Downloading ${rootHash}...`);
@@ -119,6 +133,7 @@ export class StorageService {
   /**
    * Save checkpoint state for a subscription/scheduled job
    * Key pattern: checkpoint:{subscriptionId}
+   * Stores the root hash in KV index for retrieval
    * @param {string} subscriptionId - The subscription/job identifier
    * @param {object} state - Checkpoint state (lastCheckedBlock, lastAlertTimestamp, context, etc.)
    * @returns {Promise<string>} CID of the uploaded checkpoint
@@ -130,7 +145,10 @@ export class StorageService {
       savedAt: Math.floor(Date.now() / 1000),
       version: "1.0",
     };
-    return this.uploadData(checkpoint, `checkpoint-${subscriptionId}.json`);
+    const rootHash = await this.uploadData(checkpoint, `checkpoint-${subscriptionId}.json`);
+    // CRIT-2 FIX: Store the real root hash in KV index
+    await this.setKey(`checkpoint:${subscriptionId}`, rootHash);
+    return rootHash;
   }
 
   /**
@@ -140,10 +158,13 @@ export class StorageService {
    */
   async readCheckpoint(subscriptionId) {
     try {
-      const data = await this.downloadData(
-        this._getCheckpointRootHash(subscriptionId),
-        `checkpoint-${subscriptionId}.json`
-      );
+      // CRIT-2 FIX: Get the real root hash from KV index
+      const rootHash = await this._getCheckpointRootHash(subscriptionId);
+      if (!rootHash) {
+        console.log(`[Storage] No checkpoint hash stored for ${subscriptionId}, starting fresh.`);
+        return null;
+      }
+      const data = await this.downloadData(rootHash, `checkpoint-${subscriptionId}.json`);
       return data;
     } catch (err) {
       // First run — no checkpoint exists yet
@@ -161,41 +182,118 @@ export class StorageService {
    * @returns {Promise<boolean>}
    */
   async hasCheckpoint(subscriptionId) {
-    try {
-      await this.readCheckpoint(subscriptionId);
-      return true;
-    } catch {
-      return false;
-    }
+    const checkpoint = await this.readCheckpoint(subscriptionId);
+    return checkpoint !== null;
   }
 
   /**
    * Get the storage root hash for a checkpoint
-   * In production, this would be stored on-chain or in a KV index
-   * For hackathon demo, we use a deterministic hash pattern
+   * Retrieves from KV index where it was stored by saveCheckpoint
+   * @param {string} subscriptionId - The subscription identifier
+   * @returns {Promise<string|null>} Root hash or null if not found
    */
-  _getCheckpointRootHash(subscriptionId) {
-    // For now, return a placeholder — in production this would query an index
-    // or be stored as metadata in the subscription contract
-    return `checkpoint-${subscriptionId}`;
+  async _getCheckpointRootHash(subscriptionId) {
+    // CRIT-2 FIX: Retrieve the real root hash from KV index
+    return this.getKey(`checkpoint:${subscriptionId}`);
+  }
+
+  // ─── TASK #4 SPEC FUNCTIONS ────────────────────────────────────────────
+  // Simplified wrappers for job output storage (as per Task #4 specification)
+
+  /**
+   * Upload job output data to 0G Storage
+   * Stores CID in KV index for retrieval by downloadOutput
+   * @param {string} jobId - The job identifier
+   * @param {any} data - JSON-serializable data to upload
+   * @returns {Promise<string>} Storage CID
+   */
+  async uploadOutput(jobId, data) {
+    console.log(`[Storage] Uploading output for job ${jobId}...`);
+    const rootHash = await this.uploadData(data, `output-${jobId}.json`);
+    // MED-2 FIX: Store the CID in KV index for retrieval
+    await this.setKey(`output:${jobId}`, rootHash);
+    return rootHash;
+  }
+
+  /**
+   * Download job output data from 0G Storage
+   * @param {string} jobId - The job identifier
+   * @returns {Promise<object|null>} Parsed data or null if not found
+   */
+  async downloadOutput(jobId) {
+    console.log(`[Storage] Downloading output for job ${jobId}...`);
+    try {
+      // In production, we'd query a KV index to get the CID by jobId
+      // For now, use a deterministic pattern
+      const cid = await this._getOutputCID(jobId);
+      if (!cid) return null;
+      return await this.downloadData(cid, `output-${jobId}.json`);
+    } catch (err) {
+      if (err.message?.includes("not found") || err.message?.includes("404")) {
+        console.log(`[Storage] No output found for job ${jobId}`);
+        return null;
+      }
+      throw err;
+    }
   }
 
   // ─── INDEX / KV HELPERS ────────────────────────────────────────────────
 
   /**
    * Store a key-value mapping for quick lookups
-   * Used to track CIDs by human-readable keys
+   * Uses in-memory Map for fast retrieval (demo mode)
+   * Also uploads to 0G Storage for persistence (best effort)
    * @param {string} key - Human-readable key (e.g., "agent:7:resume")
    * @param {string} cid - The 0G Storage CID
    * @returns {Promise<string>} CID of the index entry
    */
   async setKey(key, cid) {
+    // NEW-2 FIX: Store in memory for immediate retrieval
+    this._kvIndex.set(key, cid);
+    
+    // Also upload to 0G Storage for persistence (best effort)
     const indexEntry = {
       key,
       cid,
       timestamp: Math.floor(Date.now() / 1000),
     };
     return this.uploadData(indexEntry, `kv-${key.replace(/:/g, "-")}.json`);
+  }
+
+  /**
+   * Get CID by key from KV index
+   * Uses in-memory Map for fast retrieval (demo mode)
+   * @param {string} key - Human-readable key
+   * @returns {Promise<string|null>} CID or null if not found
+   */
+  async getKey(key) {
+    // NEW-2 FIX: Retrieve from in-memory Map (works within process lifetime)
+    const cid = this._kvIndex.get(key);
+    if (cid) {
+      return cid;
+    }
+    
+    // Fallback: try to load from 0G Storage (not implemented for demo)
+    // In production, this would query an on-chain KV index
+    return null;
+  }
+
+  /**
+   * Get the storage CID for a job output
+   * In production, this queries a KV index or on-chain registry
+   * For hackathon demo, uses deterministic pattern
+   * @param {string} jobId - The job identifier
+   * @returns {Promise<string|null>} CID or null if not found
+   */
+  async _getOutputCID(jobId) {
+    // Try to fetch from KV index first
+    const key = `output:${jobId}`;
+    const cid = await this.getKey(key);
+    if (cid) return cid;
+
+    // Fallback: return deterministic pattern (for demo/testing)
+    // In production, this would be stored on-chain or in a proper KV index
+    return null;
   }
 
   /**

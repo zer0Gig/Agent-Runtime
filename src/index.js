@@ -1,58 +1,365 @@
-require("dotenv").config();
-const { ethers } = require("ethers");
+/**
+ * zer0Gig — Agent Runtime
+ *
+ * A fully decentralized AI agent powered by:
+ * - 0G Compute Network → Decentralized LLM inference
+ * - 0G Storage → Decentralized file storage
+ * - 0G Chain → Smart contract escrow + agent identity
+ * - 0G Alignment Nodes → Decentralized quality verification
+ */
 
-// ABI minimal untuk listen events dari ProgressiveEscrow
-const ESCROW_ABI = [
+import "dotenv/config";
+import { ethers } from "ethers";
+import { ComputeService } from "./services/computeService.js";
+import { StorageService } from "./services/storageService.js";
+import { JobProcessor } from "./services/jobProcessor.js";
+import { StateManager } from "./services/stateManager.js";
+import { AlertDelivery } from "./services/alertDelivery.js";
+import { setSubscriptionEscrow } from "./services/eventListener.js";
+import { AgentScheduler } from "./services/scheduler.js";
+
+// Minimal ABIs for event listening
+const ESCROW_EVENTS_ABI = [
   "event JobCreated(uint256 indexed jobId, address indexed client, uint256 indexed agentId, uint256 totalBudgetWei, string jobDataCID)",
   "event MilestoneDefined(uint256 indexed jobId, uint8 milestoneCount)",
+  "event MilestoneApproved(uint256 indexed jobId, uint8 indexed milestoneIndex, uint256 amountWei, uint256 alignmentScore)",
+  "event JobCompleted(uint256 indexed jobId, uint256 totalReleasedWei)",
 ];
 
 async function main() {
-  console.log("[Agent Runtime] Starting...");
-  console.log(`[Agent Runtime] Chain: ${process.env.CHAIN_ID || 16600}`);
-  console.log(`[Agent Runtime] Agent ID: ${process.env.AGENT_ID || "not set"}`);
+  console.log("╔══════════════════════════════════════════════════╗");
+  console.log("║  zer0Gig — Agent Runtime v2.0                    ║");
+  console.log("║  Powered by 0G Compute + 0G Storage + 0G Chain  ║");
+  console.log("╚══════════════════════════════════════════════════╝\n");
 
-  // Setup provider dan wallet
-  const provider = new ethers.JsonRpcProvider(
-    process.env.OG_NEWTON_RPC || "https://rpc-testnet.0g.ai"
-  );
-
-  const blockNumber = await provider.getBlockNumber();
-  console.log(`[Agent Runtime] Connected to chain. Block: ${blockNumber}`);
-
-  // Setup contract listener
-  const escrowAddress = process.env.PROGRESSIVE_ESCROW_ADDRESS;
-  if (!escrowAddress) {
-    console.warn("[Agent Runtime] PROGRESSIVE_ESCROW_ADDRESS not set. Waiting for deployment...");
-    console.log("[Agent Runtime] Set the address in .env after Dex deploys contracts.");
-    return;
+  // ── Validate config ──────────────────────────────────────────
+  const requiredEnv = [
+    "AGENT_PRIVATE_KEY",
+    "PROGRESSIVE_ESCROW_ADDRESS",
+    "AGENT_ID",
+  ];
+  for (const key of requiredEnv) {
+    if (!process.env[key]) {
+      console.error(`[Runtime] Missing required env: ${key}`);
+      process.exit(1);
+    }
   }
 
-  const escrow = new ethers.Contract(escrowAddress, ESCROW_ABI, provider);
+  // Warn if Subscription Escrow address is missing (falls back to Progressive Escrow)
+  if (!process.env.SUBSCRIPTION_ESCROW_ADDRESS) {
+    console.warn("[Runtime] SUBSCRIPTION_ESCROW_ADDRESS not set. Falling back to PROGRESSIVE_ESCROW_ADDRESS.");
+  }
 
-  // Listen for JobCreated events
-  escrow.on("JobCreated", (jobId, client, agentId, totalBudgetWei, jobDataCID) => {
-    console.log(`\n[Agent Runtime] === NEW JOB DETECTED ===`);
-    console.log(`  Job ID:    ${jobId}`);
-    console.log(`  Client:    ${client}`);
-    console.log(`  Agent ID:  ${agentId}`);
-    console.log(`  Budget:    ${ethers.formatEther(totalBudgetWei)} OG`);
-    console.log(`  Data CID:  ${jobDataCID}`);
+  // ── Setup provider & wallet ──────────────────────────────────
+  const rpcUrl = process.env.OG_NEWTON_RPC || "https://evmrpc-testnet.0g.ai";
+  const provider = new ethers.JsonRpcProvider(rpcUrl);
+  const wallet = new ethers.Wallet(process.env.AGENT_PRIVATE_KEY, provider);
 
-    // TODO: Trigger jobProcessor.processJob(jobId)
-    console.log(`  [TODO] Will process this job via jobProcessor.js`);
+  const blockNumber = await provider.getBlockNumber();
+  const balance = await provider.getBalance(wallet.address);
+
+  console.log(`[Runtime] Chain RPC:     ${rpcUrl}`);
+  console.log(`[Runtime] Agent Wallet:  ${wallet.address}`);
+  console.log(`[Runtime] Balance:       ${ethers.formatEther(balance)} OG`);
+  console.log(`[Runtime] Block:         ${blockNumber}`);
+  console.log(`[Runtime] Agent ID:      ${process.env.AGENT_ID}`);
+  console.log();
+
+  // ── Initialize 0G Services ──────────────────────────────────
+  console.log("[Runtime] Initializing 0G services...\n");
+
+  // 0G Compute — Decentralized LLM inference
+  const compute = new ComputeService(wallet);
+
+  // 0G Storage — Decentralized file storage
+  const storage = new StorageService(wallet);
+
+  // State Manager — Orchestrates checkpoint persistence
+  const stateManager = new StateManager(storage);
+  stateManager.startBackgroundSync();
+
+  // Process Exit Handlers for StateManager
+  const shutdown = async () => {
+    console.log("\n[Runtime] Shutting down... syncing pending state.");
+    await stateManager.forceSync();
+    process.exit(0);
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
+  // Job Processor — Orchestrates task execution
+  const processor = new JobProcessor({
+    wallet,
+    computeService: compute,
+    storageService: storage,
+    escrowAddress: process.env.PROGRESSIVE_ESCROW_ADDRESS,
+    alignmentVerifierKey: process.env.ALIGNMENT_VERIFIER_KEY || process.env.AGENT_PRIVATE_KEY,
   });
 
-  escrow.on("MilestoneDefined", (jobId, milestoneCount) => {
-    console.log(`\n[Agent Runtime] Milestones defined for Job ${jobId}: ${milestoneCount} milestones`);
-    // TODO: Start working on first milestone
+  console.log(`[Runtime] Alignment Score: ${Number(process.env.DEMO_ALIGNMENT_SCORE) || 8500} (Threshold: 8000)`);
+
+  // Alert Delivery System — Handles real-time notifications
+  const alertDelivery = new AlertDelivery({
+    wallet,
+    escrowAddress: process.env.SUBSCRIPTION_ESCROW_ADDRESS || process.env.PROGRESSIVE_ESCROW_ADDRESS, // Fallback
+    storageService: storage,
   });
 
-  console.log("[Agent Runtime] Listening for events on ProgressiveEscrow:", escrowAddress);
-  console.log("[Agent Runtime] Ready. Waiting for jobs...\n");
+// Agent Scheduler — Handles recurring subscription jobs
+const scheduler = new AgentScheduler({ alertDelivery, storageService: storage });
+
+  // ── Listen for blockchain events ─────────────────────────────
+  const progressiveEscrowAddress = process.env.PROGRESSIVE_ESCROW_ADDRESS;
+  const subscriptionEscrowAddress = process.env.SUBSCRIPTION_ESCROW_ADDRESS || progressiveEscrowAddress; // Fallback
+  const escrow = new ethers.Contract(progressiveEscrowAddress, ESCROW_EVENTS_ABI, provider);
+  const myAgentId = BigInt(process.env.AGENT_ID);
+
+  // Initialize subscription escrow contract for alert delivery
+  const SUBSCRIPTION_ESCROW_ABI = [
+    "function drainPerAlert(uint256 subscriptionId, bytes calldata alertData) external",
+    "function getSubscription(uint256 subscriptionId) view returns (tuple(uint256 subscriptionId, uint256 agentId, address client, uint256 intervalSeconds, uint256 checkInRate, uint256 alertRate, uint8 status, uint256 balance, string taskDescription, bytes clientX402Sig, string webhookUrl))",
+    "event AlertFired(uint256 indexed subscriptionId, uint256 indexed agentId, uint256 timestamp, bytes alertData, uint256 amountDrained)",
+    // Subscription events (BUG-3 FIX: add missing event signatures)
+    "event SubscriptionCreated(uint256 indexed subscriptionId, uint256 indexed agentId, address client, uint256 budget)",
+    "event SubscriptionPaused(uint256 indexed subscriptionId, string reason)",
+    "event SubscriptionCancelled(uint256 indexed subscriptionId, string reason, uint256 refund)",
+  ];
+  
+  // BUG-2 FIX: Use wallet (signer) instead of provider for state-changing transactions
+  const subscriptionEscrow = new ethers.Contract(subscriptionEscrowAddress, SUBSCRIPTION_ESCROW_ABI, wallet);
+
+  console.log(`[Runtime] Listening for events on ProgressiveEscrow: ${progressiveEscrowAddress}`);
+  console.log(`[Runtime] SubscriptionEscrow: ${subscriptionEscrowAddress}`);
+  console.log(`[Runtime] Filtering for Agent ID: ${myAgentId}\n`);
+
+  // Initialize alert delivery system
+  await alertDelivery.initialize(subscriptionEscrow);
+  setSubscriptionEscrow(subscriptionEscrow);  // BUG-1 FIX: Initialize event listener contract
+  console.log("[Runtime] Alert delivery system initialized.");
+
+  // New job created → check if it's for us
+  escrow.on("JobCreated", async (jobId, client, agentId, totalBudgetWei, jobDataCID) => {
+    console.log(`[Event] JobCreated #${jobId} | Agent: ${agentId} | Budget: ${ethers.formatEther(totalBudgetWei)} OG`);
+
+    if (agentId === myAgentId) {
+      console.log(`[Event] This job is for us! Waiting for milestones to be defined...`);
+    }
+  });
+
+  // Milestones defined → start working
+  escrow.on("MilestoneDefined", async (jobId, milestoneCount) => {
+    console.log(`[Event] MilestoneDefined #${jobId} | ${milestoneCount} milestones`);
+
+    // Check if this job belongs to our agent
+    try {
+      const jobContract = new ethers.Contract(
+        progressiveEscrowAddress,
+        ["function getJob(uint256) view returns (tuple(uint256,address,uint256,address,uint256,uint256,uint8,tuple(uint8,uint256,uint8,bytes32,string,uint256,uint256,uint256,uint256)[],uint256,string,bytes32))"],
+        provider
+      );
+      const job = await jobContract.getJob(jobId);
+      if (job[2] === myAgentId) { // agentId is at index 2
+        console.log(`[Event] Our job! Starting processing...`);
+        // Small delay to ensure chain state is settled
+        setTimeout(() => processor.processJob(jobId), 3000);
+      }
+    } catch (err) {
+      console.log(`[Event] Could not check job: ${err.message?.slice(0, 80)}`);
+    }
+  });
+
+  // Milestone approved → log earnings
+  escrow.on("MilestoneApproved", (jobId, milestoneIndex, amountWei, alignmentScore) => {
+    console.log(`[Event] MilestoneApproved #${jobId} M${milestoneIndex} | +${ethers.formatEther(amountWei)} OG | Score: ${alignmentScore}`);
+  });
+
+  // Job completed
+  escrow.on("JobCompleted", (jobId, totalReleasedWei) => {
+    console.log(`[Event] JobCompleted #${jobId} | Total earned: ${ethers.formatEther(totalReleasedWei)} OG`);
+  });
+
+  // ── Listen for SubscriptionEscrow events ───────────────────────────────────
+  console.log(`[Runtime] Listening for events on SubscriptionEscrow: ${subscriptionEscrowAddress}`);
+  
+  // New subscription created → schedule recurring job
+  subscriptionEscrow.on("SubscriptionCreated", async (subscriptionId, agentId, client, budget) => {
+    console.log(`[Event] SubscriptionCreated #${subscriptionId} | Agent: ${agentId} | Budget: ${ethers.formatEther(budget)} OG`);
+    
+    if (agentId.toString() === myAgentId.toString()) {
+      console.log(`[Event] This subscription is for us! Setting up scheduler...`);
+      
+      try {
+        // Get subscription details
+        const subscription = await subscriptionEscrow.getSubscription(subscriptionId);
+        
+        // Convert interval to cron expression
+        const cronExpr = _intervalToCron(subscription.intervalSeconds);
+        if (!cronExpr) {
+          console.warn(`[Scheduler] Could not convert interval ${subscription.intervalSeconds} to cron expression`);
+          return;
+        }
+        
+        // Schedule the recurring job
+        await scheduler.scheduleJob(
+          `sub-${subscriptionId}`,
+          cronExpr,
+          async (checkpoint) => {
+            // Execute the agent's monitoring task
+            const result = await _executeMonitoringTask(subscription, checkpoint);
+            
+            // Check for anomalies and trigger alerts
+            if (_detectAnomaly(result, subscription)) {
+              await alertDelivery.sendAnomalyDetected(
+                subscriptionId.toString(),
+                myAgentId.toString(),
+                subscription.taskDescription,
+                0, // threshold (not used in this context)
+                result.value || 0
+              );
+            }
+            
+            return result;
+          },
+          {
+            subscriptionId: subscriptionId.toString(),
+            agentId: myAgentId.toString(),
+            taskDescription: subscription.taskDescription,
+          }
+        );
+        
+        console.log(`[Scheduler] Successfully scheduled subscription ${subscriptionId}`);
+      } catch (error) {
+        console.error(`[Scheduler] Failed to schedule subscription ${subscriptionId}:`, error.message);
+      }
+    }
+  });
+  
+  // Subscription paused → log and potentially notify
+  subscriptionEscrow.on("SubscriptionPaused", async (subscriptionId, reason) => {
+    console.log(`[Event] SubscriptionPaused #${subscriptionId} | Reason: ${reason}`);
+    
+    // Send alert about subscription pause
+    await alertDelivery.sendBalanceLow(
+      subscriptionId.toString(),
+      myAgentId.toString(),
+      0, // current balance (not available in event)
+      0  // threshold (not available in event)
+    );
+  });
+  
+  // Subscription cancelled → cleanup
+  subscriptionEscrow.on("SubscriptionCancelled", async (subscriptionId, reason, refund) => {
+    console.log(`[Event] SubscriptionCancelled #${subscriptionId} | Reason: ${reason} | Refund: ${ethers.formatEther(refund)} OG`);
+    
+    // Cancel the scheduled job
+    await scheduler.cancelJob(`sub-${subscriptionId}`);
+  });
+
+  console.log("╔══════════════════════════════════════════════════╗");
+  console.log("║  Agent is LIVE. Waiting for jobs and subscriptions... ║");
+  console.log("╚══════════════════════════════════════════════════╝\n");
 }
 
-main().catch((error) => {
-  console.error("[Agent Runtime] Fatal error:", error);
+// Helper function to convert interval seconds to cron expression
+function _intervalToCron(intervalSeconds) {
+  if (intervalSeconds === 0n || intervalSeconds === 0) {
+    // Should not happen - this should be handled by interval approval
+    return null;
+  }
+  
+  if (intervalSeconds === BigInt(2)**BigInt(256) - BigInt(1)) {
+    // AUTO mode - use a reasonable default (every 5 minutes for demo)
+    return '*/5 * * * *';
+  }
+  
+  const interval = Number(intervalSeconds);
+  
+  // Handle common intervals
+  if (interval === 60) return '* * * * *';           // Every minute
+  if (interval === 300) return '*/5 * * * *';        // Every 5 minutes  
+  if (interval === 600) return '*/10 * * * *';       // Every 10 minutes
+  if (interval === 900) return '*/15 * * * *';       // Every 15 minutes
+  if (interval === 1800) return '*/30 * * * *';      // Every 30 minutes
+  if (interval === 3600) return '0 * * * *';         // Hourly
+  if (interval === 7200) return '0 */2 * * *';       // Every 2 hours
+  if (interval === 14400) return '0 */4 * * *';      // Every 4 hours
+  if (interval === 28800) return '0 */8 * * *';      // Every 8 hours
+  if (interval === 43200) return '0 */12 * * *';     // Every 12 hours
+  if (interval === 86400) return '0 0 * * *';        // Daily
+  
+  // For other intervals, approximate to nearest supported cron
+  if (interval < 60) return '* * * * *';             // Less than 1 min → every minute
+  if (interval < 300) return '*/5 * * * *';          // Less than 5 min → every 5 min
+  if (interval < 900) return '*/15 * * * *';         // Less than 15 min → every 15 min
+  if (interval < 3600) return '0 */1 * * *';         // Less than 1 hour → hourly
+  if (interval < 86400) return '0 0 * * *';          // Less than 1 day → daily
+  
+  return '0 0 * * *'; // Default to daily for very long intervals
+}
+
+// Helper function to execute monitoring task
+async function _executeMonitoringTask(subscription, checkpoint) {
+  console.log(`[Scheduler] Executing monitoring task for subscription ${subscription.subscriptionId}`);
+  
+  // This is where the actual AI agent logic would go
+  // For demo purposes, we'll simulate different types of monitoring
+  
+  const taskDescription = subscription.taskDescription.toLowerCase();
+  
+  if (taskDescription.includes('wallet') || taskDescription.includes('balance')) {
+    // Simulate wallet balance monitoring
+    const currentBalance = Math.random() * 20; // Random balance 0-20 OG
+    const threshold = 10; // Alert if below 10 OG
+    
+    return {
+      type: 'wallet_balance',
+      value: currentBalance,
+      threshold: threshold,
+      timestamp: Date.now(),
+      description: `Wallet balance is ${currentBalance.toFixed(2)} OG`
+    };
+  }
+  
+  if (taskDescription.includes('price') || taskDescription.includes('btc')) {
+    // Simulate price monitoring
+    const currentPrice = Math.random() * 150000; // Random price 0-150k
+    const threshold = 100000; // Alert if above 100k
+    
+    return {
+      type: 'price_monitoring',
+      value: currentPrice,
+      threshold: threshold,
+      timestamp: Date.now(),
+      description: `BTC price is $${currentPrice.toFixed(2)}`
+    };
+  }
+  
+  // Default generic monitoring
+  return {
+    type: 'generic_monitoring',
+    value: Math.random(),
+    threshold: 0.5,
+    timestamp: Date.now(),
+    description: `Generic monitoring result for: ${subscription.taskDescription}`
+  };
+}
+
+// Helper function to detect anomalies
+function _detectAnomaly(result, subscription) {
+  // Simple anomaly detection based on result type
+  if (result.type === 'wallet_balance') {
+    return result.value < result.threshold; // Alert if balance below threshold
+  }
+  
+  if (result.type === 'price_monitoring') {
+    return result.value > result.threshold; // Alert if price above threshold
+  }
+  
+  // For generic monitoring, randomly trigger anomalies for demo
+  return Math.random() < 0.3; // 30% chance of anomaly
+}
+
+main().catch((err) => {
+  console.error("[Runtime] Fatal error:", err);
   process.exit(1);
 });

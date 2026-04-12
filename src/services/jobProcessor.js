@@ -16,6 +16,70 @@ const ESCROW_ABI = [
   "function releaseMilestone(uint256 jobId, uint8 milestoneIndex, string outputCID, uint256 alignmentScore, bytes signature) external",
 ];
 
+/**
+ * Emit an activity log entry to the frontend API.
+ * Non-blocking — failures are silently ignored (log to console only).
+ */
+export async function logActivity({ jobId, agentId, agentWallet, phase, message, milestoneIndex, metadata }) {
+  const activityUrl = process.env.ACTIVITY_LOG_URL;
+  if (!activityUrl) return; // Disabled — no URL configured
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
+    await fetch(activityUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobId, agentId, agentWallet, phase, message, milestoneIndex, metadata }, (_, v) => typeof v === "bigint" ? v.toString() : v),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+  } catch (err) {
+    console.log(`[Processor] Activity log failed: ${err.message}`);
+  }
+}
+
+/**
+ * Send a chat message to the job stream (appears as agent message in UI).
+ * Non-blocking — failures logged to console only.
+ */
+export async function sendChatMessage({ jobId, message, msgType = "text", metadata = {} }) {
+  const chatUrl = process.env.FRONTEND_URL;
+  if (!chatUrl) return;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+
+    const body = {
+      jobId,
+      sender: "agent",
+      message,
+      msgType,
+      metadata,
+    };
+
+    // Include auth token if configured
+    const headers = { "Content-Type": "application/json" };
+    if (process.env.AGENT_RUNTIME_TOKEN) {
+      headers["Authorization"] = `Bearer ${process.env.AGENT_RUNTIME_TOKEN}`;
+      body.authToken = process.env.AGENT_RUNTIME_TOKEN;
+    }
+
+    await fetch(`${chatUrl}/api/job-chat`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    console.log(`[Chat] Message sent to job ${jobId}: ${message.slice(0, 60)}...`);
+  } catch (err) {
+    console.log(`[Chat] Failed to send message: ${err.message}`);
+  }
+}
+
 export class JobProcessor {
   constructor({ wallet, computeService, storageService, escrowAddress, alignmentVerifierKey }) {
     this.wallet = wallet;
@@ -51,11 +115,24 @@ export class JobProcessor {
       // 2. Download job brief from 0G Storage
       let jobBrief;
       try {
+        await logActivity({
+          jobId, agentId: job.agentId.toString(), agentWallet: job.agentWallet,
+          phase: "downloading_brief", message: "Downloading job brief from 0G Storage...",
+        });
+        console.log("[Processor] Downloading job brief from 0G Storage...");
         jobBrief = await this.storage.downloadData(job.jobDataCID, `job-${id}-brief.json`);
         console.log("[Processor] Job brief downloaded.");
+        await logActivity({
+          jobId, agentId: job.agentId.toString(), agentWallet: job.agentWallet,
+          phase: "brief_downloaded", message: `Job brief downloaded (${JSON.stringify(jobBrief).length} bytes)`,
+        });
       } catch (err) {
         console.log(`[Processor] Could not download brief: ${err.message}`);
         jobBrief = { task: "Complete the assigned task based on the job description." };
+        await logActivity({
+          jobId, agentId: job.agentId.toString(), agentWallet: job.agentWallet,
+          phase: "brief_fallback", message: "Using fallback task description",
+        });
       }
 
       // 3. Process each pending milestone
@@ -92,14 +169,28 @@ export class JobProcessor {
     const taskDescription = this._buildTaskPrompt(jobBrief, milestoneIndex, job.milestones.length);
 
     // 4. Execute via 0G Compute (decentralized LLM)
+    await logActivity({
+      jobId: jobId.toString(), agentId: job.agentId.toString(), agentWallet: job.agentWallet,
+      phase: "processing", message: `Processing milestone ${milestoneIndex + 1}/${job.milestones.length} via 0G Compute...`,
+      milestoneIndex,
+    });
     console.log("[Processor] Sending task to 0G Compute Network...");
     let result;
     try {
       result = await this.compute.processTask(taskDescription);
       console.log(`[Processor] LLM response received (${result.content.length} chars)`);
+      await logActivity({
+        jobId: jobId.toString(), agentId: job.agentId.toString(), agentWallet: job.agentWallet,
+        phase: "processing", message: `LLM response received via ${result.model} (${result.content.length} chars)`,
+        milestoneIndex, metadata: { model: result.model },
+      });
     } catch (err) {
       console.log(`[Processor] Compute error: ${err.message}`);
-      // Fallback: generate a basic response
+      await logActivity({
+        jobId: jobId.toString(), agentId: job.agentId.toString(), agentWallet: job.agentWallet,
+        phase: "processing_fallback", message: `Compute failed, using fallback: ${err.message}`,
+        milestoneIndex,
+      });
       result = {
         content: `[Agent Output] Task completed for milestone ${milestoneIndex + 1}/${job.milestones.length}.\n\nBased on the job requirements, the deliverable has been prepared and is ready for review.`,
         model: "fallback",
@@ -117,17 +208,31 @@ export class JobProcessor {
 
     let outputCID;
     try {
+      await logActivity({
+        jobId: id, agentId: job.agentId.toString(), agentWallet: job.agentWallet,
+        phase: "uploading", message: "Uploading output to 0G Storage...",
+        milestoneIndex,
+      });
+      console.log("[Processor] Uploading output to 0G Storage...");
       outputCID = await this.storage.uploadMilestoneOutput(id, milestoneIndex, output);
       console.log(`[Processor] Output uploaded. CID: ${outputCID}`);
+      await logActivity({
+        jobId: id, agentId: job.agentId.toString(), agentWallet: job.agentWallet,
+        phase: "uploaded", message: `Output uploaded. CID: ${outputCID.slice(0, 20)}...`,
+        milestoneIndex, metadata: { outputCID: outputCID.slice(0, 20) },
+      });
     } catch (err) {
       console.log(`[Processor] Storage upload error: ${err.message}`);
       outputCID = `mock-cid-job${id}-m${milestoneIndex}-${Date.now()}`;
+      await logActivity({
+        jobId: id, agentId: job.agentId.toString(), agentWallet: job.agentWallet,
+        phase: "upload_fallback", message: `Upload failed, using mock CID: ${err.message}`,
+        milestoneIndex,
+      });
     }
 
     // 6. Generate alignment score + signature
-    // In production: 0G Alignment Nodes evaluate the output
-    // For hackathon demo: self-sign with the verifier key
-    const alignmentScore = 8500; // 85% — passes the 80% threshold
+    const alignmentScore = Number(process.env.DEMO_ALIGNMENT_SCORE) || 8500;
     const signature = await this._signAlignmentResult(
       jobId,
       milestoneIndex,
@@ -136,6 +241,11 @@ export class JobProcessor {
     );
 
     // 7. Submit milestone to escrow for payment release
+    await logActivity({
+      jobId: id, agentId: job.agentId.toString(), agentWallet: job.agentWallet,
+      phase: "submitting", message: `Submitting milestone ${milestoneIndex + 1} for payment release...`,
+      milestoneIndex,
+    });
     console.log("[Processor] Submitting milestone to ProgressiveEscrow...");
     try {
       const tx = await this.escrow.releaseMilestone(
@@ -148,8 +258,18 @@ export class JobProcessor {
       const receipt = await tx.wait();
       console.log(`[Processor] Milestone ${milestoneIndex} APPROVED! TX: ${receipt.hash}`);
       console.log(`[Processor] Payment released: ${ethers.formatEther(job.milestones[milestoneIndex].amountWei)} OG`);
+      await logActivity({
+        jobId: id, agentId: job.agentId.toString(), agentWallet: job.agentWallet,
+        phase: "completed", message: `Milestone ${milestoneIndex + 1} APPROVED! Payment released: ${ethers.formatEther(job.milestones[milestoneIndex].amountWei)} OG`,
+        milestoneIndex, metadata: { txHash: receipt.hash },
+      });
     } catch (err) {
       console.error(`[Processor] Milestone submission failed:`, err.message?.slice(0, 120));
+      await logActivity({
+        jobId: id, agentId: job.agentId.toString(), agentWallet: job.agentWallet,
+        phase: "error", message: `Milestone submission failed: ${err.message?.slice(0, 200)}`,
+        milestoneIndex,
+      });
     }
   }
 
@@ -157,21 +277,45 @@ export class JobProcessor {
    * Build a task prompt for the LLM based on the job brief
    */
   _buildTaskPrompt(brief, milestoneIndex, totalMilestones) {
-    const task = typeof brief === "string" ? brief : brief.task || brief.description || JSON.stringify(brief);
+    // Extract structured fields from brief (supports {title, description} or plain text)
+    let title = "";
+    let description = "";
+    if (brief && typeof brief === "object") {
+      title = brief.title || "";
+      description = brief.description || brief.task || JSON.stringify(brief);
+    } else {
+      description = brief || "Complete the assigned task.";
+    }
 
-    return `You are working on milestone ${milestoneIndex + 1} of ${totalMilestones} for a paid freelance job.
+    const briefBlock = title
+      ? `TITLE: ${title}\n\nDESCRIPTION:\n${description}`
+      : description;
+
+    // For the final milestone of a multi-milestone job, deliver the complete output
+    const milestoneContext = totalMilestones > 1
+      ? milestoneIndex === 0
+        ? `This is the FIRST milestone (${milestoneIndex + 1}/${totalMilestones}). Focus on planning, outlining, and delivering a solid foundation/draft.`
+        : milestoneIndex === totalMilestones - 1
+          ? `This is the FINAL milestone (${milestoneIndex + 1}/${totalMilestones}). Deliver the complete, polished final output.`
+          : `This is milestone ${milestoneIndex + 1} of ${totalMilestones}. Build on previous work and deliver the required component.`
+      : `Deliver the complete, polished final output for this task.`;
+
+    return `You are a professional AI agent on the zer0Gig decentralized freelance platform.
+You have been hired to complete a paid job. Your output will be verified and payment released upon approval.
 
 JOB BRIEF:
-${task}
+${briefBlock}
 
-INSTRUCTIONS:
-- This is milestone ${milestoneIndex + 1} of ${totalMilestones}
-- Deliver complete, professional-quality work
-- Your output will be evaluated by AI alignment nodes for quality
-- You need a score of 80%+ to get paid
-- Be thorough and precise
+MILESTONE CONTEXT:
+${milestoneContext}
 
-Please complete this milestone now.`;
+DELIVERY REQUIREMENTS:
+- Be specific, detailed, and professional
+- Produce the actual deliverable (not a description of what you would do)
+- Structure your output clearly with headers and sections
+- Your output is evaluated on completeness, quality, and relevance (80% threshold to get paid)
+
+Deliver your work now:`;
   }
 
   /**

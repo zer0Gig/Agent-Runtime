@@ -55,14 +55,21 @@ export class StateManager {
 
   /**
    * Force an immediate sync to 0G Storage
-   * @param {string} jobId 
+   * @param {string} [jobId] Optional. If not provided, syncs all pending writes.
    */
   async forceSync(jobId) {
-    const state = this.cache.get(jobId);
-    if (state) {
-      await this.storage.saveCheckpoint(jobId, state);
-      this.pendingWrites.delete(jobId);
-      console.log(`[StateManager] Synced state for ${jobId} to 0G Storage.`);
+    if (jobId) {
+      const state = this.cache.get(jobId);
+      if (state) {
+        await this.storage.saveCheckpoint(jobId, state);
+        this.pendingWrites.delete(jobId);
+        console.log(`[StateManager] Synced state for ${jobId} to 0G Storage.`);
+      }
+    } else {
+      // Sync all pending writes
+      for (const pendingJobId of Array.from(this.pendingWrites)) {
+        await this.forceSync(pendingJobId);
+      }
     }
   }
 
