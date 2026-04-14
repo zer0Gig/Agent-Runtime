@@ -14,6 +14,9 @@
 import { ethers } from "ethers";
 import { StorageService } from "./storageService.js";
 import { PlatformJobProcessor } from "./platformJobProcessor.js";
+import { CustomerServiceBot } from "./telegramConnector.js";
+import { ExtendedComputeService } from "./extendedComputeService.js";
+import { MemoryService } from "./memoryService.js";
 import { AlertDelivery } from "./alertDelivery.js";
 import { AgentScheduler } from "./scheduler.js";
 import { validateCapabilityManifest } from "../schemas/capabilitySchema.js";
@@ -33,6 +36,7 @@ const PROGRESSIVE_ESCROW_ABI = [
 ];
 
 const SUBSCRIPTION_ESCROW_ABI = [
+  "function totalSubscriptions() view returns (uint256)",
   "function drainPerCheckIn(uint256 subscriptionId) external",
   "function getSubscription(uint256 subscriptionId) view returns (tuple(uint256 subscriptionId, uint256 agentId, address client, uint256 intervalSeconds, uint256 checkInRate, uint256 alertRate, uint8 status, uint256 balance, string taskDescription, bytes clientX402Sig, string webhookUrl))",
   "event SubscriptionCreated(uint256 indexed subscriptionId, uint256 indexed agentId, address client, uint256 budget)",
@@ -81,6 +85,9 @@ export class PlatformDispatcher {
     // Auto-discovery config
     this._registryContract = null;
     this._scanInterval = null;
+
+    // Per-agent customer service bots (keyed by agentId string)
+    this.customerServiceBots = new Map();
   }
 
   /**
@@ -178,11 +185,25 @@ export class PlatformDispatcher {
     subContract.on("SubscriptionCancelled", async (subscriptionId, reason, refund) => {
       console.log(`[PlatformDispatcher] SubscriptionCancelled #${subscriptionId} | ${reason} | Refund: ${ethers.formatEther(refund)} OG`);
       await this.scheduler.cancelJob(`sub-${subscriptionId}`);
+      // Stop customer service bot for this subscription if running
+      const key = `sub-${subscriptionId}`;
+      const bot = this.customerServiceBots.get(key);
+      if (bot) {
+        await bot.stop().catch(() => {});
+        this.customerServiceBots.delete(key);
+        console.log(`[PlatformDispatcher] Customer service bot stopped for cancelled Subscription #${subscriptionId}`);
+      }
     });
 
     console.log(`[PlatformDispatcher] Managing ${this.managedAgentIds.size} agent(s): ${Array.from(this.managedAgentIds).join(", ")}`);
     console.log(`[PlatformDispatcher] Listening for events on ProgressiveEscrow + SubscriptionEscrow...`);
     console.log(`[PlatformDispatcher] Auto-discovery: scanning for new AgentMinted events every 60s\n`);
+
+    // Start auto-persist for scheduler state
+    this.scheduler.startAutoPersist();
+
+    // Recover existing subscriptions from on-chain
+    await this._recoverSubscriptions();
   }
 
   /**
@@ -244,6 +265,107 @@ export class PlatformDispatcher {
   }
 
   /**
+   * Recovers existing subscriptions from SubscriptionEscrow on startup.
+   * Re-schedules all active subscriptions for managed agents.
+   */
+  async _recoverSubscriptions() {
+    console.log("[PlatformDispatcher] Recovering existing subscriptions...");
+
+    const subContract = new ethers.Contract(
+      this.subscriptionEscrowAddress,
+      SUBSCRIPTION_ESCROW_ABI,
+      this.provider
+    );
+
+    try {
+      const total = await subContract.totalSubscriptions();
+      console.log(`[PlatformDispatcher] Found ${total} total subscriptions on-chain`);
+
+      let recovered = 0;
+
+      for (let i = 1; i <= Number(total); i++) {
+        try {
+          const sub = await subContract.getSubscription(i);
+          const subAgentId = Number(sub.agentId);
+          const subAgentIdStr = subAgentId.toString();
+
+          if (!this.managedAgentIds.has(subAgentIdStr)) continue;
+          if (Number(sub.status) === 3) continue;
+
+          const intervalSeconds = Number(sub.intervalSeconds);
+          const cronExpr = this._intervalToCron(intervalSeconds);
+          if (!cronExpr) {
+            console.warn(`[PlatformDispatcher] Unsupported interval for sub ${i}: ${intervalSeconds}s`);
+            continue;
+          }
+
+          this.scheduler.scheduleJob(
+            `sub-${i}`,
+            cronExpr,
+            async (checkpoint) => {
+              return await this._executeSubscriptionJob(i, sub, checkpoint);
+            },
+            {
+              subscriptionId: i.toString(),
+              agentId: subAgentIdStr,
+              taskDescription: sub.taskDescription,
+            }
+          );
+
+          recovered++;
+          console.log(`[PlatformDispatcher] Recovered subscription ${i}: "${sub.taskDescription}" (${cronExpr})`);
+
+          // Start client customer service bot if configured
+          await this._startClientBotForSubscription(i, subAgentIdStr);
+        } catch (err) {
+          console.warn(`[PlatformDispatcher] Failed to recover subscription ${i}: ${err.message?.slice(0, 80)}`);
+        }
+      }
+
+      console.log(`[PlatformDispatcher] Recovery complete. Recovered ${recovered} subscription(s).`);
+    } catch (err) {
+      console.error(`[PlatformDispatcher] Failed to scan subscriptions: ${err.message}`);
+    }
+  }
+
+  /**
+   * Convert interval seconds to cron expression.
+   */
+  _intervalToCron(intervalSeconds) {
+    if (intervalSeconds === 0 || intervalSeconds === 0n) return null;
+    if (intervalSeconds === BigInt(2) ** BigInt(256) - BigInt(1)) return "*/5 * * * *";
+
+    const interval = Number(intervalSeconds);
+    if (interval === 60) return "* * * * *";
+    if (interval === 300) return "*/5 * * * *";
+    if (interval === 600) return "*/10 * * * *";
+    if (interval === 900) return "*/15 * * * *";
+    if (interval === 1800) return "*/30 * * * *";
+    if (interval === 3600) return "0 * * * *";
+    if (interval === 7200) return "0 */2 * * *";
+    if (interval === 14400) return "0 */4 * * *";
+    if (interval === 28800) return "0 */8 * * *";
+    if (interval === 43200) return "0 */12 * * *";
+    if (interval === 86400) return "0 0 * * *";
+    if (interval < 60) return "* * * * *";
+    if (interval < 300) return "*/5 * * * *";
+    if (interval < 900) return "*/15 * * * *";
+    return "*/5 * * * *";
+  }
+
+  /**
+   * Execute a subscription job.
+   */
+  async _executeSubscriptionJob(subscriptionId, subscription, checkpoint) {
+    return {
+      type: "subscription_execution",
+      subscriptionId: subscriptionId.toString(),
+      taskDescription: subscription.taskDescription,
+      timestamp: Date.now(),
+    };
+  }
+
+  /**
    * Loads a single agent config.
    */
   async _loadAgentConfig(agentId) {
@@ -282,6 +404,78 @@ export class PlatformDispatcher {
     console.log(`[PlatformDispatcher] Agent ${agentId} config loaded successfully.`);
     console.log(`[PlatformDispatcher]   Provider: ${manifest.platformConfig?.llmProvider || "unknown"}`);
     console.log(`[PlatformDispatcher]   Model:    ${manifest.platformConfig?.model || manifest.model || "unknown"}`);
+
+  }
+
+  /**
+   * Fetches a client's bot token from Supabase client_bot_configs and starts a
+   * CustomerServiceBot for that specific subscription.
+   * Keyed by "sub-{subscriptionId}" — one bot per client subscription.
+   */
+  async _startClientBotForSubscription(subscriptionId, agentIdStr) {
+    const key = `sub-${subscriptionId}`;
+    if (this.customerServiceBots.has(key)) return; // already running
+
+    const supabaseUrl     = process.env.SUPABASE_URL;
+    // client_bot_configs has RLS with no public policies — must use service role key
+    const supabaseKey     = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+    if (!supabaseUrl || !supabaseKey) return;
+
+    try {
+      const res = await fetch(
+        `${supabaseUrl}/rest/v1/client_bot_configs?subscription_id=eq.${subscriptionId}&select=bot_token,allowed_chats`,
+        { headers: { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}` } }
+      );
+      if (!res.ok) return;
+      const rows = await res.json();
+      if (!rows?.length || !rows[0].bot_token) return;
+
+      const { bot_token: botToken, allowed_chats: allowedChats = [] } = rows[0];
+
+      const agentConfig = this.agentConfigs.get(agentIdStr) || {};
+      const extendedCompute = new ExtendedComputeService(this.wallet, {
+        provider: agentConfig.platformConfig?.llmProvider || "0g-compute",
+        systemPrompt: agentConfig.platformConfig?.systemPrompt || "You are a helpful customer service assistant.",
+      });
+
+      const memoryService = new MemoryService(agentIdStr, extendedCompute, this.storage);
+
+      const bot = new CustomerServiceBot({
+        botToken,
+        allowedChats,
+        extendedCompute,
+        memoryService,
+        storageService: this.storage,
+      });
+
+      await bot.start();
+      this.customerServiceBots.set(key, bot);
+      console.log(`[PlatformDispatcher] Client customer service bot started for Subscription #${subscriptionId} (Agent ${agentIdStr})`);
+    } catch (err) {
+      console.error(`[PlatformDispatcher] Failed to start client bot for Subscription #${subscriptionId}:`, err.message);
+    }
+  }
+
+  /**
+   * Gracefully shuts down all customer service bots.
+   * Call on SIGTERM/SIGINT.
+   */
+  async stop() {
+    console.log("[PlatformDispatcher] Stopping customer service bots...");
+    for (const [agentId, bot] of this.customerServiceBots) {
+      try {
+        await bot.stop();
+        console.log(`[PlatformDispatcher] Customer service bot stopped for Agent ${agentId}`);
+      } catch (err) {
+        console.error(`[PlatformDispatcher] Error stopping bot for Agent ${agentId}:`, err.message);
+      }
+    }
+    this.customerServiceBots.clear();
+
+    if (this._scanInterval) {
+      clearInterval(this._scanInterval);
+      this._scanInterval = null;
+    }
   }
 
   /**
@@ -356,46 +550,12 @@ export class PlatformDispatcher {
       );
 
       console.log(`[PlatformDispatcher] Subscription #${subscriptionId} scheduled (${cronExpr})`);
+
+      // Start client customer service bot if the client has one configured
+      await this._startClientBotForSubscription(subscriptionId.toString(), agentIdStr);
     } catch (err) {
       console.error(`[PlatformDispatcher] Failed to schedule subscription #${subscriptionId}:`, err.message);
     }
-  }
-
-  // ── Subscription helpers (mirror of index.js) ───────────────────────────
-
-  _intervalToCron(intervalSeconds) {
-    if (intervalSeconds === BigInt(2) ** BigInt(256) - BigInt(1)) return "*/5 * * * *"; // AUTO
-    const s = Number(intervalSeconds);
-    if (s === 0)     return null;
-    if (s <= 60)     return "* * * * *";
-    if (s <= 300)    return "*/5 * * * *";
-    if (s <= 900)    return "*/15 * * * *";
-    if (s <= 1800)   return "*/30 * * * *";
-    if (s <= 3600)   return "0 * * * *";
-    if (s <= 7200)   return "0 */2 * * *";
-    if (s <= 14400)  return "0 */4 * * *";
-    if (s <= 28800)  return "0 */8 * * *";
-    if (s <= 43200)  return "0 */12 * * *";
-    return "0 0 * * *";
-  }
-
-  async _executeMonitoringTask(subscription, systemPrompt, checkpoint) {
-    const task = subscription.taskDescription?.toLowerCase() || "";
-    if (task.includes("wallet") || task.includes("balance")) {
-      const value = Math.random() * 20;
-      return { type: "wallet_balance", value, threshold: 10, timestamp: Date.now(), description: `Wallet balance: ${value.toFixed(2)} OG` };
-    }
-    if (task.includes("price") || task.includes("btc") || task.includes("eth")) {
-      const value = Math.random() * 150000;
-      return { type: "price_monitoring", value, threshold: 100000, timestamp: Date.now(), description: `Price: $${value.toFixed(2)}` };
-    }
-    return { type: "generic", value: Math.random(), threshold: 0.5, timestamp: Date.now(), description: `Monitored: ${subscription.taskDescription}` };
-  }
-
-  _detectAnomaly(result) {
-    if (result.type === "wallet_balance")  return result.value < result.threshold;
-    if (result.type === "price_monitoring") return result.value > result.threshold;
-    return Math.random() < 0.3;
   }
 
   /**
