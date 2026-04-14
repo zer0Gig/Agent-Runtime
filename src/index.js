@@ -9,6 +9,7 @@
  */
 
 import "dotenv/config";
+import http from "http";
 import { ethers } from "ethers";
 import { ComputeService } from "./services/computeService.js";
 import { StorageService } from "./services/storageService.js";
@@ -117,7 +118,7 @@ const scheduler = new AgentScheduler({ alertDelivery, storageService: storage })
   // Initialize subscription escrow contract for alert delivery
   const SUBSCRIPTION_ESCROW_ABI = [
     "function drainPerAlert(uint256 subscriptionId, bytes calldata alertData) external",
-    "function getSubscription(uint256 subscriptionId) view returns (tuple(uint256 subscriptionId, uint256 agentId, address client, uint256 intervalSeconds, uint256 checkInRate, uint256 alertRate, uint8 status, uint256 balance, string taskDescription, bytes clientX402Sig, string webhookUrl))",
+    "function getSubscription(uint256 subscriptionId) view returns (tuple(uint256 subscriptionId, address client, uint256 agentId, address agentWallet, string taskDescription, uint256 intervalSeconds, uint8 intervalMode, uint256 checkInRate, uint256 alertRate, uint256 balance, uint256 totalDrained, uint8 status, uint256 createdAt, uint256 lastCheckIn, uint256 pausedAt, uint256 gracePeriodEnds, uint256 gracePeriodSeconds, bool x402Enabled, uint8 x402VerificationMode, bytes clientX402Sig, string webhookUrl, uint256 proposedInterval))",
     "event AlertFired(uint256 indexed subscriptionId, uint256 indexed agentId, uint256 timestamp, bytes alertData, uint256 amountDrained)",
     // Subscription events (BUG-3 FIX: add missing event signatures)
     "event SubscriptionCreated(uint256 indexed subscriptionId, uint256 indexed agentId, address client, uint256 budget)",
@@ -187,50 +188,7 @@ const scheduler = new AgentScheduler({ alertDelivery, storageService: storage })
     
     if (agentId.toString() === myAgentId.toString()) {
       console.log(`[Event] This subscription is for us! Setting up scheduler...`);
-      
-      try {
-        // Get subscription details
-        const subscription = await subscriptionEscrow.getSubscription(subscriptionId);
-        
-        // Convert interval to cron expression
-        const cronExpr = _intervalToCron(subscription.intervalSeconds);
-        if (!cronExpr) {
-          console.warn(`[Scheduler] Could not convert interval ${subscription.intervalSeconds} to cron expression`);
-          return;
-        }
-        
-        // Schedule the recurring job
-        await scheduler.scheduleJob(
-          `sub-${subscriptionId}`,
-          cronExpr,
-          async (checkpoint) => {
-            // Execute the agent's monitoring task
-            const result = await _executeMonitoringTask(subscription, checkpoint);
-            
-            // Check for anomalies and trigger alerts
-            if (_detectAnomaly(result, subscription)) {
-              await alertDelivery.sendAnomalyDetected(
-                subscriptionId.toString(),
-                myAgentId.toString(),
-                subscription.taskDescription,
-                0, // threshold (not used in this context)
-                result.value || 0
-              );
-            }
-            
-            return result;
-          },
-          {
-            subscriptionId: subscriptionId.toString(),
-            agentId: myAgentId.toString(),
-            taskDescription: subscription.taskDescription,
-          }
-        );
-        
-        console.log(`[Scheduler] Successfully scheduled subscription ${subscriptionId}`);
-      } catch (error) {
-        console.error(`[Scheduler] Failed to schedule subscription ${subscriptionId}:`, error.message);
-      }
+      await handleSubscription(subscriptionId, storage, scheduler, alertDelivery, wallet, myAgentId, subscriptionEscrow);
     }
   });
   
@@ -258,6 +216,160 @@ const scheduler = new AgentScheduler({ alertDelivery, storageService: storage })
   console.log("╔══════════════════════════════════════════════════╗");
   console.log("║  Agent is LIVE. Waiting for jobs and subscriptions... ║");
   console.log("╚══════════════════════════════════════════════════╝\n");
+
+  // Start auto-persist for scheduler state
+  scheduler.startAutoPersist();
+
+  // Recover existing subscriptions from on-chain
+  await recoverSubscriptions(subscriptionEscrow, scheduler, myAgentId);
+
+  startHealthCheck();
+}
+
+async function handleSubscription(subscriptionId, storageService, schedulerInstance, alertDeliveryInstance, walletInstance, agentId, subscriptionEscrowContract) {
+  try {
+    const sub = await subscriptionEscrowContract.getSubscription(subscriptionId);
+    const subAgentId = Number(sub.agentId);
+
+    if (subAgentId !== agentId) {
+      console.log(`[Sub] Skipping subscription ${subscriptionId} — not my agent`);
+      return;
+    }
+
+    if (Number(sub.status) === 3) {
+      console.log(`[Sub] Skipping subscription ${subscriptionId} — cancelled`);
+      return;
+    }
+
+    const cronExpr = _intervalToCron(Number(sub.intervalSeconds));
+    if (!cronExpr) {
+      console.warn(`[Sub] Unsupported interval: ${sub.intervalSeconds}s for sub ${subscriptionId}`);
+      return;
+    }
+
+    console.log(`[Sub] New subscription ${subscriptionId}: "${sub.taskDescription}" → ${cronExpr}`);
+
+    // Log event to 0G if storage available
+    if (storageService?.appendEscrowEvent) {
+      await storageService.appendEscrowEvent("SubscriptionEscrow", "SubscriptionCreated", {
+        subscriptionId: subscriptionId.toString(),
+        agentId: subAgentId,
+        taskDescription: sub.taskDescription,
+        intervalSeconds: Number(sub.intervalSeconds),
+      });
+    }
+
+    // Schedule the job
+    await schedulerInstance.scheduleJob(
+      subscriptionId.toString(),
+      cronExpr,
+      async (checkpoint) => {
+        const result = await _executeMonitoringTask(sub, checkpoint);
+
+        if (_detectAnomaly(result, sub)) {
+          await alertDeliveryInstance?.sendAnomalyDetected(
+            subscriptionId.toString(),
+            agentId.toString(),
+            sub.taskDescription,
+            result.threshold || 0,
+            result.value || 0
+          );
+        }
+
+        return result;
+      },
+      {
+        subscriptionId: subscriptionId.toString(),
+        agentId: agentId.toString(),
+        taskDescription: sub.taskDescription,
+      }
+    );
+
+    // Log execution to 0G
+    if (storageService?.appendExecutionLog) {
+      await storageService.appendExecutionLog(subscriptionId.toString(), {
+        phase: "scheduled",
+        agentId: agentId.toString(),
+        input: {
+          taskDescription: sub.taskDescription,
+          intervalSeconds: Number(sub.intervalSeconds),
+          cronExpression: cronExpr,
+        },
+        timestamp: Math.floor(Date.now() / 1000),
+      });
+    }
+
+    console.log(`[Sub] Successfully scheduled subscription ${subscriptionId}`);
+  } catch (err) {
+    console.error(`[Sub] Failed to handle subscription ${subscriptionId}: ${err.message}`);
+  }
+}
+
+async function recoverSubscriptions(subscriptionEscrowContract, schedulerInstance, agentId) {
+  console.log("[Recovery] Scanning for existing subscriptions...");
+
+  try {
+    const total = await subscriptionEscrowContract.totalSubscriptions();
+    console.log(`[Recovery] Found ${total} total subscriptions on-chain`);
+
+    let recovered = 0;
+
+    for (let i = 1; i <= Number(total); i++) {
+      try {
+        const sub = await subscriptionEscrowContract.getSubscription(i);
+        const subAgentId = Number(sub.agentId);
+
+        if (subAgentId !== agentId) continue;
+        if (Number(sub.status) === 3) continue;
+
+        const cronExpr = _intervalToCron(Number(sub.intervalSeconds));
+        if (!cronExpr) {
+          console.warn(`[Recovery] Unsupported interval for sub ${i}: ${sub.intervalSeconds}s`);
+          continue;
+        }
+
+        schedulerInstance.scheduleJob(
+          i.toString(),
+          cronExpr,
+          async (checkpoint) => {
+            return await _executeMonitoringTask(sub, checkpoint);
+          },
+          {
+            subscriptionId: i.toString(),
+            agentId: agentId.toString(),
+            taskDescription: sub.taskDescription,
+          }
+        );
+
+        recovered++;
+        console.log(`[Recovery] Recovered subscription ${i}: "${sub.taskDescription}" (${cronExpr})`);
+      } catch (err) {
+        console.warn(`[Recovery] Failed to recover subscription ${i}: ${err.message?.slice(0, 80)}`);
+      }
+    }
+
+    console.log(`[Recovery] Done. Recovered ${recovered} subscription(s).`);
+  } catch (err) {
+    console.error(`[Recovery] Failed to scan subscriptions: ${err.message}`);
+  }
+}
+
+function startHealthCheck(port = 10000) {
+  const server = http.createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", service: "zer0gig-runtime-path-a" }));
+    } else {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "not found" }));
+    }
+  });
+
+  server.listen(port, () => {
+    console.log(`[HealthCheck] Listening on port ${port}`);
+  });
+
+  return server;
 }
 
 // Helper function to convert interval seconds to cron expression

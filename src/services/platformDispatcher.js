@@ -38,7 +38,7 @@ const PROGRESSIVE_ESCROW_ABI = [
 const SUBSCRIPTION_ESCROW_ABI = [
   "function totalSubscriptions() view returns (uint256)",
   "function drainPerCheckIn(uint256 subscriptionId) external",
-  "function getSubscription(uint256 subscriptionId) view returns (tuple(uint256 subscriptionId, uint256 agentId, address client, uint256 intervalSeconds, uint256 checkInRate, uint256 alertRate, uint8 status, uint256 balance, string taskDescription, bytes clientX402Sig, string webhookUrl))",
+  "function getSubscription(uint256 subscriptionId) view returns (tuple(uint256 subscriptionId, address client, uint256 agentId, address agentWallet, string taskDescription, uint256 intervalSeconds, uint8 intervalMode, uint256 checkInRate, uint256 alertRate, uint256 balance, uint256 totalDrained, uint8 status, uint256 createdAt, uint256 lastCheckIn, uint256 pausedAt, uint256 gracePeriodEnds, uint256 gracePeriodSeconds, bool x402Enabled, uint8 x402VerificationMode, bytes clientX402Sig, string webhookUrl, uint256 proposedInterval))",
   "event SubscriptionCreated(uint256 indexed subscriptionId, uint256 indexed agentId, address client, uint256 budget)",
   "event SubscriptionPaused(uint256 indexed subscriptionId, string reason)",
   "event SubscriptionCancelled(uint256 indexed subscriptionId, string reason, uint256 refund)",
