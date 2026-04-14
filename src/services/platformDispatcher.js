@@ -86,8 +86,10 @@ export class PlatformDispatcher {
     this._registryContract = null;
     this._scanInterval = null;
 
-    // Per-agent customer service bots (keyed by agentId string)
+    // Per-subscription customer service bots (keyed by "sub-{id}")
     this.customerServiceBots = new Map();
+    // Tracks bot tokens already running — prevents 409 when multiple subs share one token
+    this._runningBotTokens = new Set();
   }
 
   /**
@@ -444,6 +446,12 @@ export class PlatformDispatcher {
 
       const { bot_token: botToken, allowed_chats: allowedChats = [] } = rows[0];
 
+      // Deduplicate — one polling connection per token (Telegram 409 otherwise)
+      if (this._runningBotTokens.has(botToken)) {
+        console.log(`[CS Bot] Sub #${subscriptionId}: bot token already polling (shared across subs) — skipping duplicate`);
+        return;
+      }
+
       const agentConfig = this.agentConfigs.get(agentIdStr) || {};
       const extendedCompute = new ExtendedComputeService(this.wallet, {
         provider: agentConfig.platformConfig?.llmProvider || "0g-compute",
@@ -462,6 +470,7 @@ export class PlatformDispatcher {
 
       await bot.start();
       this.customerServiceBots.set(key, bot);
+      this._runningBotTokens.add(botToken);
       console.log(`[PlatformDispatcher] Client customer service bot started for Subscription #${subscriptionId} (Agent ${agentIdStr})`);
     } catch (err) {
       console.error(`[PlatformDispatcher] Failed to start client bot for Subscription #${subscriptionId}:`, err.message);
