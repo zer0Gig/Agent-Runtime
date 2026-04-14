@@ -419,16 +419,28 @@ export class PlatformDispatcher {
     const supabaseUrl     = process.env.SUPABASE_URL;
     // client_bot_configs has RLS with no public policies — must use service role key
     const supabaseKey     = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
-    if (!supabaseUrl || !supabaseKey) return;
+    console.log(`[CS Bot] Checking sub #${subscriptionId} — supabaseUrl=${!!supabaseUrl} serviceKey=${!!process.env.SUPABASE_SERVICE_ROLE_KEY} anonKey=${!!process.env.SUPABASE_ANON_KEY}`);
+    if (!supabaseUrl || !supabaseKey) {
+      console.warn(`[CS Bot] Sub #${subscriptionId}: missing SUPABASE_URL or key — skipping`);
+      return;
+    }
 
     try {
       const res = await fetch(
         `${supabaseUrl}/rest/v1/client_bot_configs?subscription_id=eq.${subscriptionId}&select=bot_token,allowed_chats`,
         { headers: { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}` } }
       );
-      if (!res.ok) return;
+      console.log(`[CS Bot] Sub #${subscriptionId}: Supabase response status=${res.status}`);
+      if (!res.ok) {
+        console.warn(`[CS Bot] Sub #${subscriptionId}: Supabase error ${res.status} — ${await res.text()}`);
+        return;
+      }
       const rows = await res.json();
-      if (!rows?.length || !rows[0].bot_token) return;
+      console.log(`[CS Bot] Sub #${subscriptionId}: rows found=${rows?.length ?? 0}`);
+      if (!rows?.length || !rows[0].bot_token) {
+        console.log(`[CS Bot] Sub #${subscriptionId}: no bot token configured — skipping`);
+        return;
+      }
 
       const { bot_token: botToken, allowed_chats: allowedChats = [] } = rows[0];
 
