@@ -30,6 +30,9 @@
     "openai": "^4.28.0",
     "telegraf": "^4.16.3"
   },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "devDependencies": {
     "@babel/register": "^7.24.1",
     "chai": "^4.3.10",

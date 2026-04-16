@@ -497,6 +497,8 @@ export class PlatformDispatcher {
       clearInterval(this._scanInterval);
       this._scanInterval = null;
     }
+
+    this.scheduler.stopAutoPersist();
   }
 
   /**

@@ -1,0 +1,13 @@
+[railway]
+name = "zer0gig-runtime"
+environment = "production"
+
+[deploy]
+region = "singapore"
+runtime = "node"
+startCommand = "npm run start:platform"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+
+[env]
+PORT = "10000"

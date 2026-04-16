@@ -6,7 +6,7 @@ WORKDIR /app
 # Copy package files for dependency installation
 COPY package*.json ./
 
-# Install dependencies (including devDependencies for build if needed)
+# Install dependencies
 RUN npm ci
 
 # Copy source code
@@ -31,8 +31,8 @@ RUN chown -R appuser:appgroup /app
 # Switch to non-root user
 USER appuser
 
-# Expose default port (if any, though runtime is mostly internal)
-# EXPOSE 3000
+# Expose port (Railway injects PORT env var)
+EXPOSE 10000
 
-# Default command (Path A: Self-Hosted)
-CMD ["npm", "start"]
+# Platform Dispatcher (Path B: manages all platform agents + subscriptions)
+CMD ["npm", "run", "start:platform"]

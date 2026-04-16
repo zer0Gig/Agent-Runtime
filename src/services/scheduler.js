@@ -1,10 +1,21 @@
-import cron from 'node-cron';
+import cron from "node-cron";
 
 class AgentScheduler {
   constructor({ storageService, alertDelivery } = {}) {
     this.jobs = new Map(); // jobId → { cronJob, lastRun, config }
     this.storage = storageService; // Store storage service instance
     this.alertDelivery = alertDelivery;
+    this._listeners = new Map();
+  }
+
+  on(event, fn) {
+    if (!this._listeners.has(event)) this._listeners.set(event, []);
+    this._listeners.get(event).push(fn);
+  }
+
+  emit(event, ...args) {
+    const fns = this._listeners.get(event) || [];
+    fns.forEach((fn) => fn(...args));
   }
 
   /**
@@ -101,6 +112,100 @@ class AgentScheduler {
       jobId,
       ...this.getJobStatus(jobId),
     }));
+  }
+
+  /**
+   * Persist scheduler state to 0G Storage
+   */
+  async persistSchedule() {
+    if (!this.storage) return;
+
+    try {
+      const schedule = [];
+      for (const [jobId, entry] of this.jobs.entries()) {
+        schedule.push({
+          jobId,
+          config: entry.config,
+          createdAt: entry.createdAt,
+        });
+      }
+
+      const rootHash = await this.storage.uploadData(
+        schedule,
+        `scheduler-state-${Date.now()}.json`
+      );
+
+      await this.storage.setKey("scheduler:latest", rootHash);
+      console.log(`[Scheduler] Schedule persisted to 0G: ${rootHash?.slice(0, 12)}...`);
+    } catch (err) {
+      console.warn(`[Scheduler] Failed to persist schedule: ${err.message}`);
+    }
+  }
+
+  /**
+   * Load scheduler state from 0G Storage
+   */
+  async loadSchedule() {
+    if (!this.storage) return;
+
+    try {
+      const rootHash = await this.storage.getKey("scheduler:latest");
+      if (!rootHash) return;
+
+      const schedule = await this.storage.downloadData(rootHash);
+      if (!Array.isArray(schedule)) return;
+
+      let restored = 0;
+      for (const entry of schedule) {
+        if (entry.jobId && entry.config) {
+          this.emit("restore", entry);
+          restored++;
+        }
+      }
+
+      console.log(`[Scheduler] Schedule restored from 0G: ${restored} job(s)`);
+    } catch (err) {
+      console.warn(`[Scheduler] Failed to restore schedule: ${err.message}`);
+    }
+  }
+
+  /**
+   * Auto-persist scheduler state every N milliseconds
+   */
+  startAutoPersist(intervalMs = 5 * 60 * 1000) {
+    this._persistInterval = setInterval(() => this.persistSchedule(), intervalMs);
+    console.log(`[Scheduler] Auto-persist enabled (every ${intervalMs / 1000 / 60} min)`);
+  }
+
+  stopAutoPersist() {
+    if (this._persistInterval) {
+      clearInterval(this._persistInterval);
+      this._persistInterval = null;
+    }
+  }
+
+  /**
+   * Pause a job (stop cron but keep in Map)
+   */
+  async pauseJob(jobId) {
+    const job = this.jobs.get(jobId);
+    if (job && job.cronJob) {
+      job.cronJob.stop();
+      job.paused = true;
+      console.log(`[Scheduler] Job ${jobId} paused`);
+    }
+  }
+
+  /**
+   * Resume a paused job
+   */
+  async resumeJob(jobId) {
+    const job = this.jobs.get(jobId);
+    if (job && job.paused) {
+      job.cronJob.start();
+      job.paused = false;
+      console.log(`[Scheduler] Job ${jobId} resumed`);
+    }
   }
 
   // Private helpers
