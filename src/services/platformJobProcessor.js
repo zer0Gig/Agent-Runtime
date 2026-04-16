@@ -9,7 +9,7 @@
 import { JobProcessor, logActivity, sendChatMessage } from "./jobProcessor.js";
 import { ExtendedComputeService } from "./extendedComputeService.js";
 import { executeForJob } from "./toolExecutor.js";
-import { sendMilestoneCard, sendNotification } from "./telegramConnector.js";
+import { sendMilestoneCard, sendNotification, sendJobCompletionAlert, CustomerServiceBot } from "./telegramConnector.js";
 import { SelfEvaluator } from "./selfEvaluator.js";
 import { MemoryService } from "./memoryService.js";
 import { ethers } from "ethers";
@@ -62,7 +62,7 @@ async function postChat(jobId, message, msgType = "text", metadata = {}) {
  */
 async function runFeedbackLoop(jobId, milestoneIndex, outputSummary, extendedCompute, telegramChatId = null, timeoutMs = 60 * 60 * 1000) {
   const REMINDER_INTERVAL = 15 * 60 * 1000; // 15 minutes between reminders
-  const POLL_INTERVAL     = 20_000;          // check for new user messages every 20s
+  const POLL_INTERVAL     = 1_000;           // check for new user messages every 1s
   const MAX_REVISIONS     = 2;
 
   const deadline        = Date.now() + timeoutMs;
@@ -238,16 +238,39 @@ export class PlatformJobProcessor extends JobProcessor {
     super(params);
     
     this.agentConfig = agentConfig;
+    this.customerServiceBot = null;
     
-    // Initialize Extended Compute Service with agent's config
-    // Pass the wallet from the parent class
     this.extendedCompute = new ExtendedComputeService(params.wallet, {
       provider: agentConfig.platformConfig?.llmProvider || "0g-compute",
       systemPrompt: agentConfig.platformConfig?.systemPrompt || "You are a helpful assistant."
     });
 
     this.selfEvaluator  = new SelfEvaluator(this.extendedCompute);
-    this.memoryService  = new MemoryService(agentConfig.agentId, this.extendedCompute);
+    this.memoryService  = new MemoryService(agentConfig.agentId, this.extendedCompute, this.storage);
+  }
+
+  async setupCustomerService() {
+    const telegramConfig = this.agentConfig.skillConfigs?.telegram_notify;
+    if (!telegramConfig?.botToken) return;
+
+    if (!this.customerServiceBot) {
+      this.customerServiceBot = new CustomerServiceBot({
+        botToken: telegramConfig.botToken,
+        allowedChats: telegramConfig.allowedChats || [],
+        extendedCompute: this.extendedCompute,
+        memoryService: this.memoryService,
+        storageService: this.storage,
+      });
+
+      await this.customerServiceBot.start();
+    }
+  }
+
+  async stopCustomerService() {
+    if (this.customerServiceBot) {
+      await this.customerServiceBot.stop();
+      this.customerServiceBot = null;
+    }
   }
 
   /**
@@ -523,6 +546,21 @@ export class PlatformJobProcessor extends JobProcessor {
         milestoneIndex,
         metadata: { txHash: receipt.hash, amountOG },
       });
+
+      // Send Telegram job completion alert
+      if (telegramChatId) {
+        try {
+          await sendJobCompletionAlert({
+            chatId: telegramChatId,
+            jobId: id,
+            title: jobBrief.title || `Job #${id}`,
+            summary: outputSummary,
+            totalEarned: `${amountOG} OG`,
+          });
+        } catch (err) {
+          console.log(`[PlatformProcessor] Telegram completion alert failed: ${err.message}`);
+        }
+      }
     } catch (err) {
       console.error(`[PlatformProcessor] Milestone submission failed:`, err.message?.slice(0, 120));
       await logActivity({
