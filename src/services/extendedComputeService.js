@@ -176,9 +176,10 @@ export class ExtendedComputeService extends ComputeService {
    * Calls OpenAI API.
    */
   async _callOpenAI(messages) {
-    console.log("[ExtendedCompute:OpenAI] Sending request...");
+    const model = this.config.model || "gpt-4o-mini";
+    console.log(`[ExtendedCompute:OpenAI] model=${model}`);
     const completion = await this.openaiClient.chat.completions.create({
-      model: "gpt-4o",
+      model,
       messages,
       max_tokens: 2048,
       temperature: 0.7
@@ -186,7 +187,7 @@ export class ExtendedComputeService extends ComputeService {
 
     return {
       content: completion.choices[0]?.message?.content || "",
-      model: "gpt-4o",
+      model,
       provider: LLM_PROVIDERS.OPEN_AI
     };
   }
@@ -195,9 +196,10 @@ export class ExtendedComputeService extends ComputeService {
    * Calls OpenRouter API.
    */
   async _callOpenRouter(messages) {
-    console.log("[ExtendedCompute:OpenRouter] Sending request...");
+    const model = this.config.model || "openai/gpt-4o";
+    console.log(`[ExtendedCompute:OpenRouter] model=${model}`);
     const completion = await this.openrouterClient.chat.completions.create({
-      model: "openai/gpt-4o", // Default model
+      model,
       messages,
       max_tokens: 2048,
       temperature: 0.7
@@ -205,7 +207,7 @@ export class ExtendedComputeService extends ComputeService {
 
     return {
       content: completion.choices[0]?.message?.content || "",
-      model: completion.model,
+      model: completion.model || model,
       provider: LLM_PROVIDERS.OPEN_ROUTER
     };
   }
@@ -214,9 +216,10 @@ export class ExtendedComputeService extends ComputeService {
    * Calls Alibaba (DashScope) API.
    */
   async _callAlibaba(messages) {
-    console.log("[ExtendedCompute:Alibaba] Sending request...");
+    const model = this.config.model || "qwen-max";
+    console.log(`[ExtendedCompute:Alibaba] model=${model}`);
     const completion = await this.alibabaClient.chat.completions.create({
-      model: "qwen-max",
+      model,
       messages,
       max_tokens: 2048,
       temperature: 0.7
@@ -224,7 +227,7 @@ export class ExtendedComputeService extends ComputeService {
 
     return {
       content: completion.choices[0]?.message?.content || "",
-      model: "qwen-max",
+      model,
       provider: LLM_PROVIDERS.ALIBABA
     };
   }
@@ -233,9 +236,10 @@ export class ExtendedComputeService extends ComputeService {
    * Calls Google (Gemini) API via OpenAI Compatible endpoint.
    */
   async _callGoogle(messages) {
-    console.log("[ExtendedCompute:Google] Sending request...");
+    const model = this.config.model || "gemini-1.5-pro-latest";
+    console.log(`[ExtendedCompute:Google] model=${model}`);
     const completion = await this.googleClient.chat.completions.create({
-      model: "gemini-1.5-pro-latest",
+      model,
       messages,
       max_tokens: 2048,
       temperature: 0.7
@@ -243,7 +247,7 @@ export class ExtendedComputeService extends ComputeService {
 
     return {
       content: completion.choices[0]?.message?.content || "",
-      model: "gemini-1.5-pro",
+      model,
       provider: LLM_PROVIDERS.GOOGLE
     };
   }
@@ -264,8 +268,10 @@ export class ExtendedComputeService extends ComputeService {
       content: m.content
     }));
 
+    const model = this.config.model || "claude-sonnet-4-6";
+    console.log(`[ExtendedCompute:Anthropic] model=${model}`);
     const completion = await this.anthropicClient.messages.create({
-      model: "claude-3-5-sonnet-20240620",
+      model,
       max_tokens: 2048,
       system: systemMsg?.content,
       messages: anthropicMsgs
@@ -273,7 +279,7 @@ export class ExtendedComputeService extends ComputeService {
 
     return {
       content: completion.content[0]?.text || "",
-      model: "claude-3-5-sonnet",
+      model,
       provider: LLM_PROVIDERS.ANTHROPIC
     };
   }
@@ -282,9 +288,10 @@ export class ExtendedComputeService extends ComputeService {
    * Calls Groq API.
    */
   async _callGroq(messages) {
-    console.log("[ExtendedCompute:Groq] Sending request...");
+    const model = this.config.model || "llama-3.3-70b-versatile";
+    console.log(`[ExtendedCompute:Groq] model=${model}`);
     const completion = await this.groqClient.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+      model,
       messages,
       max_tokens: 2048,
       temperature: 0.7
@@ -292,7 +299,7 @@ export class ExtendedComputeService extends ComputeService {
 
     return {
       content: completion.choices[0]?.message?.content || "",
-      model: "llama-3.3-70b",
+      model,
       provider: LLM_PROVIDERS.GROQ
     };
   }

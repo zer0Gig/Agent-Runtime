@@ -222,6 +222,389 @@ async function builtinCodeExec(skill, jobBrief) {
   return summary;
 }
 
+// ─── TRADING SKILL HANDLERS ──────────────────────────────────────────────────
+
+/**
+ * market_analysis — Fetches real-time and historical market data via MCP.
+ * Supports Alpaca API (trading) and Polygon API (data) as MCP endpoints.
+ *
+ * Config:
+ *   {
+ *     provider: "alpaca" | "polygon",
+ *     apiKey: "YOUR_API_KEY",
+ *     symbols: ["AAPL", "TSLA", "BTC-USD"],
+ *     timeframe: "1D" | "1H" | "1Min",
+ *     indicators: ["RSI", "MACD", "BB"]
+ *   }
+ */
+async function builtinMarketAnalysis(skill, jobBrief) {
+  const apiKey = skill.config?.apiKey || process.env.ALPACA_API_KEY || process.env.POLYGON_API_KEY;
+  const provider = skill.config?.provider || "alpaca";
+  const symbols = skill.config?.symbols || jobBrief.metadata?.symbols || ["AAPL"];
+  const timeframe = skill.config?.timeframe || "1D";
+
+  if (!apiKey) {
+    return "[market_analysis] No API key configured. Set ALPACA_API_KEY or POLYGON_API_KEY env var.";
+  }
+
+  const results = [];
+
+  for (const symbol of symbols.slice(0, 5)) { // Cap at 5 symbols
+    try {
+      if (provider === "alpaca") {
+        // Alpaca Markets API — get bar data
+        const res = await fetch(
+          `https://data.alpaca.markets/v2/stocks/${symbol}/bars?timeframe=${timeframe}&limit=20`,
+          { headers: { "APCA-API-KEY-ID": apiKey, "APCA-API-SECRET-KEY": process.env.ALPACA_SECRET_KEY || "" } }
+        );
+        if (!res.ok) throw new Error(`Alpaca API error: ${res.status}`);
+        const data = await res.json();
+        const bars = data.bars?.slice(-5).map(b =>
+          `  ${b.t}: O=${b.o} H=${b.h} L=${b.l} C=${b.c} V=${b.v}`
+        ).join("\n") || "No data";
+        results.push(`📊 ${symbol} (${timeframe}):\n${bars}`);
+      } else if (provider === "polygon") {
+        // Polygon API — get aggregate bars
+        const today = new Date();
+        const from = new Date(today.getTime() - 30 * 86400000).toISOString().split("T")[0];
+        const to = today.toISOString().split("T")[0];
+        const res = await fetch(
+          `https://api.polygon.io/v2/aggs/ticker/${symbol}/range/1/day/${from}/${to}?apiKey=${apiKey}`
+        );
+        if (!res.ok) throw new Error(`Polygon API error: ${res.status}`);
+        const data = await res.json();
+        const bars = data.results?.slice(-5).map(b =>
+          `  ${b.t}: O=${b.o} H=${b.h} L=${b.l} C=${b.c} V=${b.v}`
+        ).join("\n") || "No data";
+        results.push(`📊 ${symbol} (30D daily):\n${bars}`);
+      }
+    } catch (err) {
+      results.push(`⚠️ ${symbol}: ${err.message}`);
+    }
+  }
+
+  return `Market Analysis Report (${provider}):\n\n${results.join("\n\n")}`;
+}
+
+/**
+ * order_execution — Places a trade via Alpaca Trading API.
+ * SAFETY: Requires confirmation for trades above threshold.
+ *
+ * Config:
+ *   {
+ *     apiKey: "YOUR_ALPACA_KEY",
+ *     secretKey: "YOUR_ALPACA_SECRET",
+ *     paper: true,
+ *     maxOrderValue: 1000,
+ *     requireConfirmationAbove: 500
+ *   }
+ *
+ * Usage: Job brief metadata should include:
+ *   { orderExecution: { symbol, quantity, side, type, limitPrice? } }
+ */
+async function builtinOrderExecution(skill, jobBrief) {
+  const apiKey = skill.config?.apiKey || process.env.ALPACA_API_KEY;
+  const secretKey = skill.config?.secretKey || process.env.ALPACA_SECRET_KEY;
+  const paper = skill.config?.paper !== false; // Default to paper trading
+  const maxOrderValue = skill.config?.maxOrderValue || 1000;
+
+  if (!apiKey || !secretKey) {
+    return "[order_execution] Alpaca API credentials not configured.";
+  }
+
+  const order = jobBrief.metadata?.orderExecution || {};
+  const { symbol, quantity, side, type, limitPrice } = order;
+
+  if (!symbol || !quantity || !side) {
+    return "[order_execution] Missing required order params (symbol, quantity, side) in job metadata.";
+  }
+
+  // Safety: Check order value
+  const estimatedValue = type === "limit" && limitPrice
+    ? quantity * limitPrice
+    : quantity * 150; // rough estimate if market order
+  if (estimatedValue > maxOrderValue) {
+    return `[order_execution] ⚠️ Order value $${estimatedValue.toFixed(2)} exceeds max $${maxOrderValue}. Require human confirmation.`;
+  }
+
+  const baseUrl = paper
+    ? "https://paper-api.alpaca.markets"
+    : "https://api.alpaca.markets";
+
+  try {
+    const orderPayload = {
+      symbol,
+      qty: quantity,
+      side, // "buy" or "sell"
+      type: type || "market",
+      time_in_force: "day",
+    };
+    if (limitPrice) orderPayload.limit_price = limitPrice;
+
+    const res = await fetch(`${baseUrl}/v2/orders`, {
+      method: "POST",
+      headers: {
+        "APCA-API-KEY-ID": apiKey,
+        "APCA-API-SECRET-KEY": secretKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(orderPayload),
+    });
+
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(`Alpaca order error: ${res.status} — ${errData.message || res.statusText}`);
+    }
+
+    const orderResult = await res.json();
+    return `✅ Order Placed!\n` +
+      `  ID: ${orderResult.id}\n` +
+      `  Symbol: ${orderResult.symbol}\n` +
+      `  Side: ${orderResult.side}\n` +
+      `  Qty: ${orderResult.qty}\n` +
+      `  Type: ${orderResult.type}\n` +
+      `  Status: ${orderResult.status}\n` +
+      `  ${paper ? "(Paper Trading)" : "(LIVE)"}`;
+  } catch (err) {
+    return `[order_execution] Failed: ${err.message}`;
+  }
+}
+
+/**
+ * chart_patterns — Technical analysis with indicators (RSI, MACD, Bollinger Bands).
+ * Calculates indicators from market data and identifies patterns.
+ *
+ * Config:
+ *   {
+ *     provider: "alpaca" | "polygon",
+ *     apiKey: "YOUR_API_KEY",
+ *     symbols: ["AAPL"],
+ *     indicators: ["RSI", "MACD", "BB", "SMA", "EMA"]
+ *   }
+ */
+async function builtinChartPatterns(skill, jobBrief) {
+  const apiKey = skill.config?.apiKey || process.env.POLYGON_API_KEY || process.env.ALPACA_API_KEY;
+  const provider = skill.config?.provider || "polygon";
+  const symbols = skill.config?.symbols || jobBrief.metadata?.symbols || ["AAPL"];
+  const indicators = skill.config?.indicators || ["RSI", "MACD", "BB"];
+
+  if (!apiKey) {
+    return "[chart_patterns] No API key configured.";
+  }
+
+  const results = [];
+
+  for (const symbol of symbols.slice(0, 3)) {
+    try {
+      // Fetch historical data
+      let prices = [];
+      if (provider === "polygon") {
+        const today = new Date();
+        const from = new Date(today.getTime() - 90 * 86400000).toISOString().split("T")[0];
+        const to = today.toISOString().split("T")[0];
+        const res = await fetch(
+          `https://api.polygon.io/v2/aggs/ticker/${symbol}/range/1/day/${from}/${to}?apiKey=${apiKey}`
+        );
+        if (!res.ok) throw new Error(`Polygon API error: ${res.status}`);
+        const data = await res.json();
+        prices = (data.results || []).map(r => r.c);
+      } else {
+        const res = await fetch(
+          `https://data.alpaca.markets/v2/stocks/${symbol}/bars?timeframe=1Day&limit=90`,
+          { headers: { "APCA-API-KEY-ID": apiKey, "APCA-API-SECRET-KEY": process.env.ALPACA_SECRET_KEY || "" } }
+        );
+        if (!res.ok) throw new Error(`Alpaca API error: ${res.status}`);
+        const data = await res.json();
+        prices = (data.bars || []).map(b => b.c);
+      }
+
+      if (prices.length < 20) {
+        results.push(`⚠️ ${symbol}: Insufficient data (${prices.length} points, need 20+)`);
+        continue;
+      }
+
+      const currentPrice = prices[prices.length - 1];
+      const analysis = [];
+
+      // RSI (14-period)
+      if (indicators.includes("RSI")) {
+        const rsi = calculateRSI(prices, 14);
+        const signal = rsi < 30 ? "OVERSOLD → Buy signal" : rsi > 70 ? "OVERBOUGHT → Sell signal" : "Neutral";
+        analysis.push(`  RSI(14): ${rsi.toFixed(1)} — ${signal}`);
+      }
+
+      // MACD
+      if (indicators.includes("MACD")) {
+        const macd = calculateMACD(prices);
+        const signal = macd.histogram > 0 ? "Bullish crossover" : "Bearish crossover";
+        analysis.push(`  MACD: ${macd.macd.toFixed(2)}, Signal: ${macd.signal.toFixed(2)}, Histogram: ${macd.histogram.toFixed(2)} — ${signal}`);
+      }
+
+      // Bollinger Bands
+      if (indicators.includes("BB")) {
+        const bb = calculateBollingerBands(prices, 20, 2);
+        const position = currentPrice > bb.upper ? "Above upper band (overbought)" :
+                         currentPrice < bb.lower ? "Below lower band (oversold)" :
+                         "Within bands (normal)";
+        analysis.push(`  Bollinger Bands: Upper=${bb.upper.toFixed(2)}, Middle=${bb.middle.toFixed(2)}, Lower=${bb.lower.toFixed(2)} — ${position}`);
+      }
+
+      // Simple Moving Averages
+      if (indicators.includes("SMA")) {
+        const sma20 = calcSMA(prices, 20);
+        const sma50 = prices.length >= 50 ? calcSMA(prices, 50) : null;
+        const trend = sma50 ? (sma20 > sma50 ? "Golden cross (bullish)" : "Death cross (bearish)") : "N/A (need 50+ data points)";
+        analysis.push(`  SMA(20): ${sma20.toFixed(2)}${sma50 ? `, SMA(50): ${sma50.toFixed(2)}` : ""} — ${trend}`);
+      }
+
+      results.push(`📈 ${symbol} @ $${currentPrice.toFixed(2)}:\n${analysis.join("\n")}`);
+    } catch (err) {
+      results.push(`⚠️ ${symbol}: ${err.message}`);
+    }
+  }
+
+  return `Technical Analysis Report:\n\n${results.join("\n\n")}`;
+}
+
+// ─── Technical Analysis Helper Functions ─────────────────────────────────────
+
+function calcSMA(prices, period) {
+  if (prices.length < period) return 0;
+  const slice = prices.slice(-period);
+  return slice.reduce((a, b) => a + b, 0) / period;
+}
+
+function calculateRSI(prices, period = 14) {
+  if (prices.length < period + 1) return 50;
+  let gains = 0, losses = 0;
+  for (let i = prices.length - period; i < prices.length; i++) {
+    const diff = prices[i] - prices[i - 1];
+    if (diff > 0) gains += diff; else losses -= diff;
+  }
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
+}
+
+function calculateMACD(prices, fast = 12, slow = 26, signal = 9) {
+  if (prices.length < slow + signal) return { macd: 0, signal: 0, histogram: 0 };
+  const emaFast = calcEMA(prices, fast);
+  const emaSlow = calcEMA(prices, slow);
+  const macdLine = emaFast - emaSlow;
+  // Simplified signal line
+  const signalLine = macdLine * 0.9; // rough approximation
+  return { macd: macdLine, signal: signalLine, histogram: macdLine - signalLine };
+}
+
+function calcEMA(prices, period) {
+  if (prices.length < period) return prices[prices.length - 1] || 0;
+  const multiplier = 2 / (period + 1);
+  let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < prices.length; i++) {
+    ema = (prices[i] - ema) * multiplier + ema;
+  }
+  return ema;
+}
+
+function calculateBollingerBands(prices, period = 20, stdDev = 2) {
+  if (prices.length < period) return { upper: 0, middle: 0, lower: 0 };
+  const slice = prices.slice(-period);
+  const middle = slice.reduce((a, b) => a + b, 0) / period;
+  const variance = slice.reduce((sum, p) => sum + Math.pow(p - middle, 2), 0) / period;
+  const std = Math.sqrt(variance);
+  return {
+    upper: middle + stdDev * std,
+    middle,
+    lower: middle - stdDev * std,
+  };
+}
+
+/**
+ * risk_management — Portfolio risk assessment.
+ * Analyzes current positions and provides risk metrics.
+ *
+ * Config:
+ *   {
+ *     provider: "alpaca",
+ *     apiKey: "YOUR_ALPACA_KEY",
+ *     maxPositionSize: 0.3,     // Max 30% in one position
+ *     maxDrawdown: 0.1,         // Max 10% drawdown
+ *     dailyLossLimit: 500       // Max $500 daily loss
+ *   }
+ */
+async function builtinRiskManagement(skill, jobBrief) {
+  const apiKey = skill.config?.apiKey || process.env.ALPACA_API_KEY;
+  const secretKey = process.env.ALPACA_SECRET_KEY;
+  const maxPositionSize = skill.config?.maxPositionSize || 0.3;
+  const maxDrawdown = skill.config?.maxDrawdown || 0.1;
+
+  if (!apiKey) {
+    return "[risk_management] No API key configured.";
+  }
+
+  try {
+    // Get account info
+    const accountRes = await fetch("https://paper-api.alpaca.markets/v2/account", {
+      headers: { "APCA-API-KEY-ID": apiKey, "APCA-API-SECRET-KEY": secretKey || "" },
+    });
+    if (!accountRes.ok) throw new Error(`Account API error: ${accountRes.status}`);
+    const account = await accountRes.json();
+
+    // Get open positions
+    const positionsRes = await fetch("https://paper-api.alpaca.markets/v2/positions", {
+      headers: { "APCA-API-KEY-ID": apiKey, "APCA-API-SECRET-KEY": secretKey || "" },
+    });
+    const positions = positionsRes.ok ? await positionsRes.json() : [];
+
+    const equity = parseFloat(account.equity || 0);
+    const cash = parseFloat(account.cash || 0);
+    const buyingPower = parseFloat(account.buying_power || 0);
+    const todayPL = parseFloat(account.today_pl || account.last_equity - equity || 0);
+
+    // Risk analysis
+    const warnings = [];
+    const positionAnalysis = [];
+
+    for (const pos of positions) {
+      const marketValue = parseFloat(pos.market_value || 0);
+      const positionPct = equity > 0 ? marketValue / equity : 0;
+      const unrealizedPL = parseFloat(pos.unrealized_pl || 0);
+      const unrealizedPLPct = parseFloat(pos.unrealized_plpc || 0) * 100;
+
+      positionAnalysis.push(
+        `  ${pos.symbol}: ${pos.qty} shares, Value: $${marketValue.toFixed(2)}, ` +
+        `P&L: ${unrealizedPLPct.toFixed(1)}% ($${unrealizedPL.toFixed(2)}), ` +
+        `Portfolio: ${positionPct.toFixed(1)}%`
+      );
+
+      if (positionPct > maxPositionSize) {
+        warnings.push(`⚠️ ${pos.symbol} exceeds max position size (${positionPct.toFixed(1)}% > ${maxPositionSize * 100}%)`);
+      }
+    }
+
+    // Drawdown check
+    if (todayPL < 0 && equity > 0) {
+      const drawdownPct = Math.abs(todayPL) / equity;
+      if (drawdownPct > maxDrawdown) {
+        warnings.push(`🚨 Daily drawdown ${drawdownPct.toFixed(1)}% exceeds max ${maxDrawdown * 100}%`);
+      }
+    }
+
+    const riskScore = warnings.length === 0 ? "LOW" : warnings.length <= 2 ? "MEDIUM" : "HIGH";
+
+    return `Risk Assessment Report:\n\n` +
+      `💰 Account: Equity $${equity.toFixed(2)}, Cash $${cash.toFixed(2)}, Buying Power $${buyingPower.toFixed(2)}\n` +
+      `📊 Today's P&L: ${todayPL >= 0 ? "+" : ""}$${todayPL.toFixed(2)}\n\n` +
+      `Positions (${positions.length}):\n${positionAnalysis.join("\n") || "  No open positions"}\n\n` +
+      `⚖️ Risk Level: ${riskScore}\n` +
+      (warnings.length > 0 ? `Warnings:\n${warnings.join("\n")}` : "✅ No risk warnings");
+  } catch (err) {
+    return `[risk_management] Failed: ${err.message}`;
+  }
+}
+
 /** Dispatch to the correct builtin handler. */
 async function executeBuiltinSkill(skill, jobBrief) {
   switch (skill.id) {

@@ -4,6 +4,7 @@ node_modules/
 # Environment
 .env
 .env.local.example
+.env.railway
 
 # Hardhat
 contracts/cache/

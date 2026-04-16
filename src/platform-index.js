@@ -9,6 +9,7 @@
  */
 
 import "dotenv/config";
+import http from "http";
 import { ethers } from "ethers";
 import { PlatformDispatcher } from "./services/platformDispatcher.js";
 import { initTelegram } from "./services/telegramConnector.js";
@@ -81,6 +82,35 @@ async function main() {
     console.error("[Platform] Fatal error:", error);
     process.exit(1);
   }
+
+  // ── Graceful Shutdown ────────────────────────────────────────
+  const shutdown = async (signal) => {
+    console.log(`\n[Platform] ${signal} received — shutting down...`);
+    await dispatcher.stop();
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT",  () => shutdown("SIGINT"));
+
+  startHealthCheck();
+}
+
+function startHealthCheck(port = parseInt(process.env.PORT || "10000")) {
+  const server = http.createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", service: "zer0gig-runtime-platform" }));
+    } else {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "not found" }));
+    }
+  });
+
+  server.listen(port, () => {
+    console.log(`[HealthCheck] Listening on port ${port}`);
+  });
+
+  return server;
 }
 
 main();

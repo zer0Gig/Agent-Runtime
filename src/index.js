@@ -354,7 +354,7 @@ async function recoverSubscriptions(subscriptionEscrowContract, schedulerInstanc
   }
 }
 
-function startHealthCheck(port = 10000) {
+function startHealthCheck(port = parseInt(process.env.PORT || "10000")) {
   const server = http.createServer((req, res) => {
     if (req.url === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
