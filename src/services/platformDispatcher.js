@@ -466,6 +466,12 @@ export class PlatformDispatcher {
         extendedCompute,
         memoryService,
         storageService: this.storage,
+        // Pass the agent's actual tools and skills so the CS Bot behaves like the real agent
+        agentId:        agentIdStr,
+        customTools:    agentConfig.tools           || [],
+        prebuiltSkills: agentConfig.prebuiltSkills  || [],
+        skillConfigs:   agentConfig.skillConfigs    || {},
+        systemPrompt:   agentConfig.platformConfig?.systemPrompt || null,
       });
 
       await bot.start();

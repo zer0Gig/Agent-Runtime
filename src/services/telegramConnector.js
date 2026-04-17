@@ -17,6 +17,7 @@
  */
 
 import { Telegraf, Markup } from "telegraf";
+import { executeForJob } from "./toolExecutor.js";
 
 const ACTIVITY_BASE =
   process.env.ACTIVITY_LOG_URL?.replace("/api/agent-activity", "") ||
@@ -388,13 +389,19 @@ export async function sendRiskAlert({ chatId, alertType, details }) {
 
 export class CustomerServiceBot {
   constructor(config) {
-    this.botToken = config.botToken;
-    this.allowedChats = config.allowedChats || [];
+    this.botToken       = config.botToken;
+    this.allowedChats   = config.allowedChats || [];
     this.extendedCompute = config.extendedCompute;
-    this.memoryService = config.memoryService;
-    this.storage = config.storageService;
-    this.bot = null;
+    this.memoryService  = config.memoryService;
+    this.storage        = config.storageService;
+    this.bot            = null;
     this._pendingEscalations = new Map();
+    // Agent tools & skills — same ones used in real job execution
+    this.agentId        = config.agentId       || null;
+    this.customTools    = config.customTools    || [];
+    this.prebuiltSkills = config.prebuiltSkills || [];
+    this.skillConfigs   = config.skillConfigs   || {};
+    this.systemPrompt   = config.systemPrompt   || null;
   }
 
   async start() {
@@ -466,22 +473,41 @@ export class CustomerServiceBot {
   }
 
   async _generateReply(chatId, message) {
-    const context = this.memoryService
+    // 1. Recall memory context for this chat
+    const memoryContext = this.memoryService
       ? await this.memoryService.recall(`telegram:${chatId}`, "customer-service")
       : null;
 
-    const systemPrompt =
+    // 2. Run agent's real tools & skills (same as a normal job execution)
+    let toolContext = "";
+    if (this.customTools.length > 0 || this.prebuiltSkills.length > 0) {
+      try {
+        toolContext = await executeForJob(
+          message,
+          this.customTools,
+          this.prebuiltSkills,
+          this.agentId
+        );
+        if (toolContext) console.log(`[CS Bot] Tool context generated for chat ${chatId}`);
+      } catch (err) {
+        console.warn(`[CS Bot] Tool execution failed: ${err.message}`);
+      }
+    }
+
+    // 3. Use the agent's own system prompt if configured, otherwise a sensible default
+    const systemPrompt = this.systemPrompt ||
       `You are a helpful customer service representative. ` +
       `Be polite, concise, and helpful. Plain text only — no HTML tags. ` +
       `If you don't know the answer, say so and offer to escalate. ` +
       `Keep responses under 500 characters.`;
 
-    const userMessage = context
-      ? `${context}\n\nCustomer: ${message}`
+    const userMessage = memoryContext
+      ? `${memoryContext}\n\nCustomer: ${message}`
       : `Customer: ${message}`;
 
-    const result = await this.extendedCompute.processTask(userMessage, systemPrompt, "");
-    // Strip any HTML tags the LLM may have included (Telegram rejects unsupported tags like <p>)
+    // 4. Call LLM with tool context injected (same pattern as platformJobProcessor)
+    const result = await this.extendedCompute.processTask(userMessage, systemPrompt, toolContext);
+    // Strip any HTML tags the LLM may have included
     return result.content.replace(/<[^>]*>/g, "").trim().slice(0, 1000);
   }
 
