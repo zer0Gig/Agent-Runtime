@@ -413,7 +413,7 @@ export class CustomerServiceBot {
       }
 
       console.log(`[CS Bot] Message from ${chatId}: "${message.slice(0, 50)}..."`);
-      await this._logMessage(chatId, "user", message);
+      this._logMessage(chatId, "user", message); // fire-and-forget — don't block handler
 
       if (this._checkEscalation(message)) {
         await this._handleEscalation(ctx, chatId, message);
@@ -422,12 +422,12 @@ export class CustomerServiceBot {
 
       try {
         const reply = await this._generateReply(chatId, message);
-        await ctx.reply(reply, { parse_mode: "HTML" });
-        await this._logMessage(chatId, "agent", reply);
+        await ctx.reply(reply); // plain text — no parse_mode needed
+        this._logMessage(chatId, "agent", reply); // fire-and-forget
       } catch (err) {
         console.error(`[CS Bot] Reply failed: ${err.message}`);
         await ctx.reply("⚠️ I'm having trouble responding right now. A human will assist shortly.");
-        await this._logMessage(chatId, "agent", `[ERROR] ${err.message}`);
+        this._logMessage(chatId, "agent", `[ERROR] ${err.message}`); // fire-and-forget
       }
     });
 
@@ -472,7 +472,7 @@ export class CustomerServiceBot {
 
     const systemPrompt =
       `You are a helpful customer service representative. ` +
-      `Be polite, concise, and helpful. Use HTML formatting. ` +
+      `Be polite, concise, and helpful. Plain text only — no HTML tags. ` +
       `If you don't know the answer, say so and offer to escalate. ` +
       `Keep responses under 500 characters.`;
 
@@ -481,7 +481,8 @@ export class CustomerServiceBot {
       : `Customer: ${message}`;
 
     const result = await this.extendedCompute.processTask(userMessage, systemPrompt, "");
-    return result.content.slice(0, 1000);
+    // Strip any HTML tags the LLM may have included (Telegram rejects unsupported tags like <p>)
+    return result.content.replace(/<[^>]*>/g, "").trim().slice(0, 1000);
   }
 
   _checkEscalation(message) {
@@ -506,7 +507,7 @@ export class CustomerServiceBot {
       `Your reference: <code>${chatId}-${Date.now()}</code>`
     );
 
-    await this._logMessage(chatId, "escalation", message);
+    this._logMessage(chatId, "escalation", message); // fire-and-forget
 
     if (process.env.ESCALATION_WEBHOOK_URL) {
       try {
