@@ -23,8 +23,10 @@ export class StorageService {
     // Use OS temp dir so it works on Railway (ephemeral /app) and locally
     this.tmpDir = process.env.TMP_DIR || join(tmpdir(), "zer0gig");
 
-    // NEW-2 FIX: In-memory KV index for demo (survives within process lifetime)
+    // In-memory KV index — fast local reads within process lifetime
     this._kvIndex = new Map();
+    // Per-key locks for appendExecutionLog — prevents concurrent write race conditions
+    this._appendLocks = new Map();
 
     if (!existsSync(this.tmpDir)) {
       mkdirSync(this.tmpDir, { recursive: true });
@@ -339,10 +341,12 @@ export class StorageService {
     const rootHash = await this.uploadData(entry, `kv-${streamId.replace(/:/g, "-")}-${key.replace(/:/g, "-")}.json`);
 
     // Update the index for this stream
-    const indexKey = `kv_index:${streamId}`;
     const index = await this.kvListIndex(streamId);
     index[key] = rootHash;
-    await this.uploadData(index, `kv-index-${streamId.replace(/:/g, "-")}.json`);
+    const indexRootHash = await this.uploadData(index, `kv-index-${streamId.replace(/:/g, "-")}.json`);
+
+    // Store the index's own root hash so kvListIndex can find it after restart
+    this._kvIndex.set(`kv_index_root:${streamId}`, indexRootHash);
 
     return rootHash;
   }
@@ -385,7 +389,11 @@ export class StorageService {
    */
   async kvListIndex(streamId) {
     try {
-      const data = await this.downloadData(`kv-index-${streamId.replace(/:/g, "-")}.json`);
+      // Use the stored root hash — NOT the filename (filename isn't a valid 0G hash)
+      const indexRootHash = this._kvIndex.get(`kv_index_root:${streamId}`);
+      if (!indexRootHash) return {}; // No index uploaded yet this session
+
+      const data = await this.downloadData(indexRootHash, `kv-index-${streamId.replace(/:/g, "-")}.json`);
       return data || {};
     } catch {
       return {};
@@ -403,27 +411,35 @@ export class StorageService {
    * @returns {Promise<string>} Root hash (CID) of the uploaded log entry
    */
   async appendExecutionLog(subscriptionId, logEntry) {
-    const entry = {
-      ...logEntry,
-      subscriptionId,
-      loggedAt: Math.floor(Date.now() / 1000),
-      version: "1.0",
-    };
+    // Serialize index updates per subscriptionId — prevents concurrent write race conditions
+    // that cause "data hash mismatch" errors on 0G Storage
+    const lockKey = `log-lock:${subscriptionId}`;
+    const prev = this._appendLocks.get(lockKey) || Promise.resolve();
 
-    const filename = `sub-${subscriptionId}-log-${entry.loggedAt}-${Math.random().toString(36).slice(2, 8)}.json`;
-    const rootHash = await this.uploadData(entry, filename);
+    const next = prev.then(async () => {
+      const entry = {
+        ...logEntry,
+        subscriptionId,
+        loggedAt: Math.floor(Date.now() / 1000),
+        version: "1.0",
+      };
 
-    // Update execution log index
-    const index = await this.listExecutionLogs(subscriptionId);
-    index.push({
-      rootHash,
-      timestamp: entry.loggedAt,
-      phase: entry.phase,
+      const filename = `sub-${subscriptionId}-log-${entry.loggedAt}-${Math.random().toString(36).slice(2, 8)}.json`;
+      const rootHash = await this.uploadData(entry, filename);
+
+      // Read → modify → write index exclusively (no other appends for this sub can run here)
+      const index = await this.listExecutionLogs(subscriptionId);
+      index.push({ rootHash, timestamp: entry.loggedAt, phase: entry.phase });
+      const indexRootHash = await this.uploadData(index, `sub-${subscriptionId}-log-index.json`);
+      // Cache the index root hash so listExecutionLogs can find it
+      this._kvIndex.set(`log-index-root:${subscriptionId}`, indexRootHash);
+
+      console.log(`[Storage] Execution log appended: sub=${subscriptionId} rootHash=${rootHash.slice(0, 12)}…`);
+      return rootHash;
     });
-    await this.uploadData(index, `sub-${subscriptionId}-log-index.json`);
 
-    console.log(`[Storage] Execution log appended: sub=${subscriptionId} rootHash=${rootHash.slice(0, 12)}…`);
-    return rootHash;
+    this._appendLocks.set(lockKey, next.catch(() => {})); // keep lock chain even on error
+    return next;
   }
 
   /**
@@ -435,7 +451,11 @@ export class StorageService {
    */
   async listExecutionLogs(subscriptionId) {
     try {
-      const data = await this.downloadData(`sub-${subscriptionId}-log-index.json`);
+      // Use the cached index root hash — NOT the filename as a hash
+      const indexRootHash = this._kvIndex.get(`log-index-root:${subscriptionId}`);
+      if (!indexRootHash) return [];
+
+      const data = await this.downloadData(indexRootHash, `sub-${subscriptionId}-log-index.json`);
       if (Array.isArray(data)) {
         return data.sort((a, b) => a.timestamp - b.timestamp);
       }
