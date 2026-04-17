@@ -686,97 +686,145 @@ export async function executeForJob(jobBrief, tools = [], prebuiltSkillIds = [],
  * @returns {string} Truncated response body.
  */
 export async function executeHttpTool(tool, jobBrief) {
-  const { endpoint, method, apiKey } = tool.config;
-  
-  // Prepare headers
-  const headers = { "Content-Type": "application/json" };
-  if (apiKey) {
-    // In production, decrypt API key here. For demo, use as-is.
-    headers["Authorization"] = `Bearer ${apiKey}`;
+  let { endpoint, method, apiKey, headers: extraHeaders, body: bodyTemplate } = tool.config;
+
+  // Normalize URL — add https:// if protocol is missing
+  if (endpoint && !endpoint.startsWith("http://") && !endpoint.startsWith("https://")) {
+    endpoint = "https://" + endpoint;
   }
 
-  // Prepare payload
-  const payload = {
-    jobBrief,
-    timestamp: new Date().toISOString()
-  };
+  const headers = { "Content-Type": "application/json", ...(extraHeaders || {}) };
+  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
 
-  console.log(`[ToolExecutor:HTTP] Calling ${method} ${endpoint}`);
-  
+  const httpMethod = (method || "GET").toUpperCase();
+
+  // Build request body only for methods that accept one
+  let body = undefined;
+  if (!["GET", "HEAD"].includes(httpMethod)) {
+    if (bodyTemplate) {
+      // Allow custom body template with {{jobBrief}} placeholder
+      body = bodyTemplate.replace("{{jobBrief}}", typeof jobBrief === "string" ? jobBrief : JSON.stringify(jobBrief));
+    } else {
+      body = JSON.stringify({ query: jobBrief, timestamp: new Date().toISOString() });
+    }
+  }
+
+  console.log(`[ToolExecutor:HTTP] ${httpMethod} ${endpoint}`);
+
   const response = await fetch(endpoint, {
-    method: method || "POST",
+    method: httpMethod,
     headers,
-    body: JSON.stringify(payload),
-    // Timeout protection: fail if endpoint takes too long
-    signal: AbortSignal.timeout(5000) 
+    body,
+    signal: AbortSignal.timeout(10000),
   });
 
   if (!response.ok) {
-    throw new Error(`HTTP Error: ${response.status} ${response.statusText}`);
+    const errText = await response.text().catch(() => "");
+    throw new Error(`HTTP ${response.status} from ${endpoint}: ${errText.slice(0, 200)}`);
   }
 
   const text = await response.text();
-  // Cap result size to prevent context overflow
-  return text.slice(0, 2000);
+  return text.slice(0, 5000);
 }
 
 // ─── MCP TOOL ───────────────────────────────────────────────────────────────
 
 /**
- * Executes an MCP tool by communicating with an MCP server.
- * 1. Lists available tools.
- * 2. Calls the appropriate tool with job context.
- * @param {object} tool - Tool configuration (config: { url }).
- * @param {object} jobBrief - Job context.
- * @returns {string} Tool execution result.
+ * Executes an MCP tool using the official @modelcontextprotocol/sdk.
+ *
+ * Supports two transport modes based on tool.config:
+ *
+ * 1. HTTP/SSE transport (remote MCP server):
+ *    config: { url: "https://my-mcp-server.com/mcp", toolName?: "my_tool" }
+ *
+ * 2. Stdio transport (local subprocess MCP server):
+ *    config: { command: "python", args: ["-m", "my_mcp"], env: {}, toolName?: "my_tool" }
+ *
+ * @param {object} tool - { name, config }
+ * @param {string} jobBrief - The task/question to pass to the tool
  */
 export async function executeMcpTool(tool, jobBrief) {
-  const { url } = tool.config;
-  
-  // Check reachability
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { config, name: toolDisplayName } = tool;
+
+  let transport;
+  let transportType;
+
+  if (config.command) {
+    // ── Stdio transport: spawn a subprocess MCP server ──────────────────────
+    const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
+    transportType = "stdio";
+    transport = new StdioClientTransport({
+      command: config.command,
+      args:    config.args  || [],
+      env:     { ...process.env, ...(config.env || {}) },
+    });
+    console.log(`[ToolExecutor:MCP] stdio — ${config.command} ${(config.args || []).join(" ")}`);
+
+  } else if (config.url) {
+    // ── HTTP/SSE transport: connect to a remote MCP server ──────────────────
+    let url = config.url;
+    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+      url = "https://" + url;
+    }
+    transportType = "http";
+
+    // Try StreamableHTTP first (MCP spec 2025-03-26), fall back to SSE (older servers)
+    try {
+      const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
+      transport = new StreamableHTTPClientTransport(new URL(url));
+      console.log(`[ToolExecutor:MCP] StreamableHTTP — ${url}`);
+    } catch {
+      const { SSEClientTransport } = await import("@modelcontextprotocol/sdk/client/sse.js");
+      transport = new SSEClientTransport(new URL(url));
+      console.log(`[ToolExecutor:MCP] SSE fallback — ${url}`);
+    }
+
+  } else {
+    throw new Error(`[ToolExecutor:MCP] Tool "${toolDisplayName}" needs config.url (HTTP) or config.command (stdio)`);
+  }
+
+  const client = new Client({ name: "zer0gig-agent", version: "2.0.0" });
+
   try {
-    await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(3000) });
-  } catch {
-    throw new Error(`MCP Server unreachable at ${url}`);
+    await client.connect(transport);
+
+    // 1. List available tools from the MCP server
+    const { tools } = await client.listTools();
+    if (!tools?.length) throw new Error("MCP server has no tools");
+
+    // 2. Pick the right tool — prefer config.toolName, then match by keyword, then first
+    const targetName = config.toolName || tool.name;
+    const picked =
+      tools.find(t => t.name === targetName) ||
+      tools.find(t => t.name.toLowerCase().includes((targetName || "").toLowerCase())) ||
+      tools[0];
+
+    console.log(`[ToolExecutor:MCP] Calling tool "${picked.name}" (${transportType})`);
+
+    // 3. Build arguments — pass jobBrief as the primary input, mapped to the tool's first string param
+    const toolArgs = {};
+    const schema = picked.inputSchema?.properties || {};
+    const firstKey = Object.keys(schema)[0];
+    if (firstKey) {
+      toolArgs[firstKey] = typeof jobBrief === "string" ? jobBrief : JSON.stringify(jobBrief);
+    }
+    // Merge any extra static args from tool config
+    Object.assign(toolArgs, config.args_override || {});
+
+    // 4. Call the tool
+    const result = await client.callTool({ name: picked.name, arguments: toolArgs });
+
+    // 5. Extract text from content array
+    const parts = (result.content || [])
+      .map(c => (c.type === "text" ? c.text : JSON.stringify(c)))
+      .filter(Boolean);
+
+    return parts.join("\n").slice(0, 5000);
+
+  } finally {
+    await client.close().catch(() => {});
   }
-
-  console.log(`[ToolExecutor:MCP] Connecting to ${url}`);
-
-  // 1. List Tools
-  const listRes = await fetch(`${url}/tools/list`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} })
-  });
-  
-  const listData = await listRes.json();
-  if (!listData.result?.tools?.length) {
-    throw new Error("No tools available on MCP server");
-  }
-
-  // 2. Call Tool (We use the first available tool for demo; in production, match by name)
-  const toolName = listData.result.tools[0].name;
-  
-  const callRes = await fetch(`${url}/tools/call`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 2,
-      method: "tools/call",
-      params: { name: toolName, arguments: { jobBrief } }
-    })
-  });
-
-  const callData = await callRes.json();
-  
-  // Extract content from result
-  if (callData.result?.content) {
-    const textContent = callData.result.content.map(c => c.text).join(" ");
-    return textContent.slice(0, 2000);
-  }
-  
-  return JSON.stringify(callData.result).slice(0, 2000);
 }
 
 // ─── API KEY DECRYPTION (STUB) ──────────────────────────────────────────────
