@@ -10,7 +10,7 @@
 import { TOOL_TYPES } from "../schemas/capabilitySchema.js";
 
 const SUPABASE_URL  = process.env.SUPABASE_URL  || process.env.NEXT_PUBLIC_SUPABASE_URL;
-const SUPABASE_KEY  = process.env.SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+const SUPABASE_KEY  = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 
 // ─── SKILLS REGISTRY ────────────────────────────────────────────────────────
 
@@ -63,10 +63,23 @@ async function resolveSkills(agentId, prebuiltSkillIds = []) {
 async function builtinWebSearch(skill, jobBrief) {
   const apiKey = skill.config?.apiKey;
   if (!apiKey) {
-    return "[web_search] No API key configured. Skipping live search.";
+    // Fallback: use DuckDuckGo instant answer API (no key needed)
+    const q = typeof jobBrief === "string" ? jobBrief : `${jobBrief.title || ""} ${jobBrief.description || ""}`;
+    try {
+      const ddgRes = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(q.slice(0, 200))}&format=json&no_html=1`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      const ddg = await ddgRes.json();
+      const answer = ddg.AbstractText || ddg.Answer || ddg.Definition || "";
+      const topics = (ddg.RelatedTopics || []).slice(0, 3).map(t => t.Text).filter(Boolean).join("\n• ");
+      if (answer || topics) return `Web search: ${answer}\n${topics ? `Related:\n• ${topics}` : ""}`;
+      return "[web_search] No results from DuckDuckGo. No Serper API key configured.";
+    } catch { return "[web_search] Search failed. No API key configured."; }
   }
 
-  const query = `${jobBrief.title} ${jobBrief.description}`.slice(0, 200);
+  const query = typeof jobBrief === "string"
+    ? jobBrief.slice(0, 200)
+    : `${jobBrief.title || ""} ${jobBrief.description || ""}`.slice(0, 200);
   const res = await fetch("https://google.serper.dev/search", {
     method: "POST",
     headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
@@ -607,14 +620,21 @@ async function builtinRiskManagement(skill, jobBrief) {
 
 /** Dispatch to the correct builtin handler. */
 async function executeBuiltinSkill(skill, jobBrief) {
-  switch (skill.id) {
+  const id = skill.id || skill.skill_id || "";
+  console.log(`[ToolExecutor] Executing builtin skill: ${id}`);
+  switch (id) {
     case "web_search":        return builtinWebSearch(skill, jobBrief);
     case "http_fetch":        return builtinHttpFetch(skill, jobBrief);
     case "github_reader":     return builtinGithubReader(skill, jobBrief);
     case "telegram_notify":   return builtinTelegramNotify(skill, jobBrief);
     case "code_exec":         return builtinCodeExec(skill, jobBrief);
+    case "market_analysis":   return builtinMarketAnalysis(skill, jobBrief);
+    case "order_execution":   return builtinOrderExecution(skill, jobBrief);
+    case "chart_patterns":    return builtinChartPatterns(skill, jobBrief);
+    case "risk_management":   return builtinRiskManagement(skill, jobBrief);
     default:
-      return `[${skill.id}] Builtin handler not implemented yet.`;
+      console.warn(`[ToolExecutor] No handler for builtin skill: ${id}`);
+      return `[${id}] Builtin handler not implemented yet.`;
   }
 }
 
@@ -651,21 +671,26 @@ export async function executeForJob(jobBrief, tools = [], prebuiltSkillIds = [],
   // ── Pre-built skills from Skills Registry ──────────────────────────────
   if (prebuiltSkillIds.length > 0) {
     const skills = await resolveSkills(agentId, prebuiltSkillIds);
+    console.log(`[ToolExecutor] Resolved ${skills.length} skill(s): ${skills.map(s => s.id || s.name).join(", ")}`);
     for (const skill of skills) {
       try {
         let result = "";
-        if (skill.tool_type === "builtin") {
+        // DB column is `tool_name`, not `tool_type`
+        const toolType = skill.tool_name || skill.tool_type || "builtin";
+        if (toolType === "builtin") {
           result = await executeBuiltinSkill(skill, jobBrief);
-        } else if (skill.tool_type === "http") {
+        } else if (toolType === "http") {
           result = await executeHttpTool(
-            { name: skill.name, config: { endpoint: skill.endpoint_url, method: "POST", ...skill.config } },
+            { name: skill.name, config: { endpoint: skill.endpoint_url || skill.config?.endpoint, method: "POST", ...skill.config } },
             jobBrief
           );
-        } else if (skill.tool_type === "mcp") {
+        } else if (toolType === "mcp") {
           result = await executeMcpTool(
-            { name: skill.name, config: { url: skill.endpoint_url, ...skill.config } },
+            { name: skill.name, config: { url: skill.endpoint_url || skill.config?.url, ...skill.config } },
             jobBrief
           );
+        } else {
+          console.warn(`[ToolExecutor] Skill ${skill.id} has unknown type: ${toolType}`);
         }
         if (result) results.push(`[Skill: ${skill.name}]\n${result}`);
       } catch (error) {

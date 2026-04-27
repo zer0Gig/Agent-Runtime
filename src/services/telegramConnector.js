@@ -402,6 +402,8 @@ export class CustomerServiceBot {
     this.prebuiltSkills = config.prebuiltSkills || [];
     this.skillConfigs   = config.skillConfigs   || {};
     this.systemPrompt   = config.systemPrompt   || null;
+    // In-session conversation history per chatId (last 10 exchanges)
+    this._history       = new Map(); // chatId → string[]
   }
 
   async start() {
@@ -429,12 +431,17 @@ export class CustomerServiceBot {
 
       try {
         const reply = await this._generateReply(chatId, message);
-        await ctx.reply(reply); // plain text — no parse_mode needed
-        this._logMessage(chatId, "agent", reply); // fire-and-forget
+        await ctx.reply(reply);
+        // Record in-session history
+        this._addToHistory(chatId, `User: ${message}`);
+        this._addToHistory(chatId, `Agent: ${reply}`);
+        // Fire-and-forget: log to 0G execution log + persist exchange to 0G memory
+        this._logMessage(chatId, "agent", reply);
+        this._persistExchange(chatId, message, reply);
       } catch (err) {
         console.error(`[CS Bot] Reply failed: ${err.message}`);
         await ctx.reply("⚠️ I'm having trouble responding right now. A human will assist shortly.");
-        this._logMessage(chatId, "agent", `[ERROR] ${err.message}`); // fire-and-forget
+        this._logMessage(chatId, "agent", `[ERROR] ${err.message}`);
       }
     });
 
@@ -472,13 +479,32 @@ export class CustomerServiceBot {
     }
   }
 
-  async _generateReply(chatId, message) {
-    // 1. Recall memory context for this chat
-    const memoryContext = this.memoryService
-      ? await this.memoryService.recall(`telegram:${chatId}`, "customer-service")
-      : null;
+  _addToHistory(chatId, line) {
+    const hist = this._history.get(chatId) || [];
+    hist.push(line);
+    if (hist.length > 20) hist.splice(0, hist.length - 20); // keep last 10 exchanges
+    this._history.set(chatId, hist);
+  }
 
-    // 2. Run agent's real tools & skills (same as a normal job execution)
+  async _generateReply(chatId, message) {
+    // ── 0G-compatible agentic pattern with persistent memory ─────────────
+    // Memory layers:
+    //   1. In-session _history Map (recent exchanges, ~10 turns)
+    //   2. 0G Storage via memoryService (cross-restart persistent learnings)
+    // Tool execution: pre-execute then inject as context (0G Compute compat)
+
+    // Phase 1: Load persistent memory from 0G Storage
+    let persistentMemory = null;
+    if (this.memoryService) {
+      try {
+        persistentMemory = await this.memoryService.recall(chatId, "telegram-cs");
+        if (persistentMemory) console.log(`[CS Bot] Memory recalled from 0G for chat ${chatId}`);
+      } catch (err) {
+        console.warn(`[CS Bot] Memory recall failed: ${err.message}`);
+      }
+    }
+
+    // Phase 2: Pre-execute all configured tools (data gathering)
     let toolContext = "";
     if (this.customTools.length > 0 || this.prebuiltSkills.length > 0) {
       try {
@@ -488,27 +514,73 @@ export class CustomerServiceBot {
           this.prebuiltSkills,
           this.agentId
         );
-        if (toolContext) console.log(`[CS Bot] Tool context generated for chat ${chatId}`);
+        if (toolContext) console.log(`[CS Bot] Tool context gathered for chat ${chatId}`);
       } catch (err) {
-        console.warn(`[CS Bot] Tool execution failed: ${err.message}`);
+        console.warn(`[CS Bot] Tool pre-execution failed: ${err.message}`);
       }
     }
 
-    // 3. Use the agent's own system prompt if configured, otherwise a sensible default
-    const systemPrompt = this.systemPrompt ||
-      `You are a helpful customer service representative. ` +
-      `Be polite, concise, and helpful. Plain text only — no HTML tags. ` +
-      `If you don't know the answer, say so and offer to escalate. ` +
-      `Keep responses under 500 characters.`;
+    // Phase 3: Build tool-aware system prompt with memory
+    const toolList = [
+      ...this.customTools.map(t => `- ${t.name}: ${t.description || t.type} (${t.type})`),
+      ...this.prebuiltSkills.map(s => `- ${s} (builtin skill)`),
+    ];
+    const toolSection = toolList.length > 0
+      ? `\n\nYou have access to these tools:\n${toolList.join("\n")}\nUse the tool data below to answer. Do NOT tell the user to run scripts or install anything — YOU are the agent, YOU execute the tools.`
+      : "";
 
-    const userMessage = memoryContext
-      ? `${memoryContext}\n\nCustomer: ${message}`
-      : `Customer: ${message}`;
+    const memorySection = persistentMemory
+      ? `\n\nLong-term memory of past conversations with this customer:\n${persistentMemory}\nUse this to remember their preferences and prior topics.`
+      : "";
 
-    // 4. Call LLM with tool context injected (same pattern as platformJobProcessor)
-    const result = await this.extendedCompute.processTask(userMessage, systemPrompt, toolContext);
-    // Strip any HTML tags the LLM may have included
-    return result.content.replace(/<[^>]*>/g, "").trim().slice(0, 1000);
+    const systemPrompt = (this.systemPrompt ||
+      `You are an autonomous AI agent on Telegram powered by zer0Gig. ` +
+      `You can fetch real-time data using your configured tools. ` +
+      `Answer directly with facts from tool results. Be concise.`) +
+      `\nPlain text only — no markdown, no code blocks, no hashtags.` +
+      toolSection + memorySection;
+
+    // Phase 4: Build conversation with in-session history
+    const hist = this._history.get(chatId) || [];
+    const conversationContext = hist.length > 0
+      ? `Current session history:\n${hist.join("\n")}\n\n`
+      : "";
+
+    const userPrompt = `${conversationContext}Customer: ${message}`;
+
+    // Phase 5: Call LLM (0G Compute compatible — standard chat completion)
+    const result = await this.extendedCompute.processTask(userPrompt, systemPrompt, toolContext);
+
+    // Phase 6: Strip formatting artifacts
+    return result.content
+      .replace(/<[^>]*>/g, "")
+      .replace(/#{1,6}\s/g, "")
+      .replace(/\*{1,2}([^*]+)\*{1,2}/g, "$1")
+      .replace(/`{1,3}[^`]*`{1,3}/gs, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim()
+      .slice(0, 1000);
+  }
+
+  /**
+   * Save conversation exchange to 0G Storage persistent memory.
+   * Non-blocking — runs in the background so Telegram responses stay fast.
+   */
+  async _persistExchange(chatId, userMessage, agentReply) {
+    if (!this.memoryService) return;
+    try {
+      await this.memoryService.save({
+        clientAddress: chatId,
+        jobId: `tg-${Date.now()}`,
+        jobType: "telegram-cs",
+        outcomeScore: 10000,
+        chatFeedback: `Customer: ${userMessage}\nAgent: ${agentReply}`,
+        outputSummary: agentReply.slice(0, 500),
+      });
+      console.log(`[CS Bot] Exchange persisted to 0G for chat ${chatId}`);
+    } catch (err) {
+      console.warn(`[CS Bot] Memory save failed: ${err.message}`);
+    }
   }
 
   _checkEscalation(message) {
