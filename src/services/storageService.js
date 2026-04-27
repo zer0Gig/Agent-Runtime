@@ -5,16 +5,34 @@
  * agent outputs, and capability manifests.
  */
 
-import { Indexer, ZgFile } from "@0gfoundation/0g-ts-sdk";
-import { writeFileSync, readFileSync, mkdirSync, existsSync } from "fs";
+import { Indexer, ZgFile, Batcher, KvClient, getFlowContract } from "@0gfoundation/0g-ts-sdk";
+import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
+import { keccak256, toUtf8Bytes, encodeBase64 } from "ethers";
 
 const INDEXER_RPC =
   process.env.OG_INDEXER_RPC ||
   "https://indexer-storage-testnet-turbo.0g.ai";
 const EVM_RPC =
   process.env.OG_NEWTON_RPC || "https://evmrpc-testnet.0g.ai";
+
+// 0G KV Node endpoint — provides cross-restart persistent KV layer (Option B).
+// If unreachable, existing in-memory Map fallback continues to work.
+const KV_NODE_RPC =
+  process.env.OG_KV_NODE_RPC ||
+  "http://3.101.147.150:6789";
+
+// Flow contract address — required for KV writes via Batcher.
+// If not set, will be resolved dynamically from indexer.selectNodes() status.
+const FLOW_ADDRESS_OVERRIDE = process.env.OG_FLOW_ADDRESS || null;
+
+// Supabase — used as a reliable fallback layer for KV pointers when the
+// 0G KV Node hasn't synced yet or is unavailable. The agent_kv_index table
+// stores (stream_id, key) → value mappings. Writes go to BOTH 0G KV Node
+// AND Supabase; reads prefer 0G KV Node and fall back to Supabase.
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 export class StorageService {
   constructor(signer) {
@@ -28,11 +46,313 @@ export class StorageService {
     // Per-key locks for appendExecutionLog — prevents concurrent write race conditions
     this._appendLocks = new Map();
 
+    // 0G KV Node — persistent layer that survives restarts (Option B).
+    // Initialized lazily on first use. Falls back silently if unreachable.
+    this._kvClient = null;    // KvClient for reads
+    this._kvBatcher = null;   // Batcher for writes (needs StorageNode[] + FlowContract)
+    this._kvInitPromise = null; // Deduplicate concurrent init attempts
+
+    // Circuit breaker state — if KV Node endpoint is unreachable, stop
+    // hitting it for N minutes. Prevents the bot from stalling on every
+    // message when the KV Node IP is down or blocked by firewall.
+    this._kvNodeFailures = 0;
+    this._kvNodeDisabledUntil = 0; // Unix ms timestamp
+    this._KV_NODE_FAILURE_THRESHOLD = 2;      // open circuit after N failures
+    this._KV_NODE_DISABLE_WINDOW_MS = 5 * 60 * 1000; // keep circuit open for 5 min
+    this._KV_NODE_CALL_TIMEOUT_MS = 3000;     // per-call timeout
+
     if (!existsSync(this.tmpDir)) {
       mkdirSync(this.tmpDir, { recursive: true });
     }
 
     console.log("[Storage] Initialized with indexer:", INDEXER_RPC);
+    console.log("[Storage] KV Node endpoint:", KV_NODE_RPC);
+  }
+
+  // ─── 0G KV NODE INTEGRATION (Option B — cross-restart persistence) ─────
+  //
+  // The existing in-memory _kvIndex Map provides fast session-local lookup,
+  // but is lost on process restart. The 0G KV Node (Batcher + KvClient) is
+  // the proper 0G-native KV layer that persists across restarts.
+  //
+  // Strategy: ADDITIVE layering — existing Map + log-layer fallback stays
+  // untouched. KV Node is a secondary layer consulted only when the Map
+  // misses. If KV Node is unreachable, graceful degrade to existing behavior.
+
+  /**
+   * Lazy-initialize the 0G KV Node client and batcher.
+   * Safe to call repeatedly — only connects once per process.
+   * Returns false if KV Node is unavailable; existing flows still work.
+   */
+  async _initKvNode() {
+    if (this._kvClient && this._kvBatcher) return true;
+    if (this._kvInitPromise) return this._kvInitPromise;
+
+    this._kvInitPromise = (async () => {
+      try {
+        // Read client works with just the RPC endpoint
+        this._kvClient = new KvClient(KV_NODE_RPC);
+
+        // Write client (Batcher) needs storage nodes + flow contract
+        const [nodes, nodeErr] = await this.indexer.selectNodes(1);
+        if (nodeErr || !nodes || nodes.length === 0) {
+          console.warn(`[KV Node] Could not select storage nodes: ${nodeErr || "empty list"}`);
+          this._kvBatcher = null; // reads still work
+          return true;
+        }
+
+        // Flow address: use env override or fetch from first node's networkIdentity
+        let flowAddress = FLOW_ADDRESS_OVERRIDE;
+        if (!flowAddress) {
+          try {
+            const status = await Promise.race([
+              nodes[0].getStatus(),
+              new Promise((_, rej) => setTimeout(() => rej(new Error("getStatus timeout")), 3000)),
+            ]);
+            flowAddress = status?.networkIdentity?.flowAddress;
+          } catch (err) {
+            console.warn(`[KV Node] getStatus failed: ${err.message}`);
+          }
+        }
+
+        if (!flowAddress) {
+          console.warn(`[KV Node] No flow address available — writes disabled, reads still work`);
+          this._kvBatcher = null;
+          return true;
+        }
+
+        const flow = getFlowContract(flowAddress, this.signer);
+        this._kvBatcher = new Batcher(1, nodes, flow, EVM_RPC);
+        console.log(`[KV Node] Write client initialized (flow=${flowAddress.slice(0, 10)}...)`);
+        return true;
+      } catch (err) {
+        console.warn(`[KV Node] Initialization failed: ${err.message} — falling back to in-memory only`);
+        this._kvClient = null;
+        this._kvBatcher = null;
+        return false;
+      }
+    })();
+
+    return this._kvInitPromise;
+  }
+
+  /**
+   * Convert a human-readable streamId string into the 32-byte hex format
+   * required by the 0G KV Node. Deterministic — same string → same streamId.
+   */
+  _toStreamId(streamIdString) {
+    return keccak256(toUtf8Bytes(streamIdString || "default"));
+  }
+
+  /**
+   * Check if the KV Node circuit breaker is currently open (i.e., recent
+   * failures have disabled KV Node calls temporarily). Returns true if
+   * calls should be SKIPPED to avoid blocking the caller.
+   */
+  _kvNodeCircuitOpen() {
+    return Date.now() < this._kvNodeDisabledUntil;
+  }
+
+  /**
+   * Record a KV Node failure. If threshold reached, open the circuit
+   * breaker to skip calls for a cooldown window.
+   */
+  _kvNodeRecordFailure(reason) {
+    this._kvNodeFailures += 1;
+    if (this._kvNodeFailures >= this._KV_NODE_FAILURE_THRESHOLD && !this._kvNodeCircuitOpen()) {
+      this._kvNodeDisabledUntil = Date.now() + this._KV_NODE_DISABLE_WINDOW_MS;
+      console.warn(
+        `[KV Node] Circuit OPENED after ${this._kvNodeFailures} failures (reason: ${reason}) — ` +
+        `skipping KV Node calls for ${this._KV_NODE_DISABLE_WINDOW_MS / 1000}s. ` +
+        `Runtime continues with in-memory + log-layer fallback only.`
+      );
+    }
+  }
+
+  /**
+   * Record a KV Node success — reset failure count.
+   */
+  _kvNodeRecordSuccess() {
+    if (this._kvNodeFailures > 0) {
+      console.log(`[KV Node] Circuit CLOSED — KV Node is reachable again`);
+    }
+    this._kvNodeFailures = 0;
+    this._kvNodeDisabledUntil = 0;
+  }
+
+  /**
+   * Race a promise against a timeout. If the promise doesn't settle within
+   * timeoutMs, rejects with a timeout error so the caller never blocks.
+   */
+  _withTimeout(promise, timeoutMs, label) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`${label} timeout after ${timeoutMs}ms`)), timeoutMs)
+      ),
+    ]);
+  }
+
+  /**
+   * Write a key-value pair to the 0G KV Node (persistent cross-restart).
+   * Non-blocking for callers — wraps errors so failures don't break the flow.
+   * Respects circuit breaker and applies aggressive timeout to prevent
+   * blocking the Telegraf polling loop.
+   * @param {string} streamIdString - Human-readable namespace
+   * @param {string} keyString      - Human-readable key
+   * @param {string} valueString    - String value to store
+   * @returns {Promise<boolean>} true if persisted, false on any failure
+   */
+  async _kvNodeWrite(streamIdString, keyString, valueString) {
+    // Circuit breaker check — skip entirely if KV Node is known to be down
+    if (this._kvNodeCircuitOpen()) return false;
+
+    try {
+      await this._withTimeout(this._initKvNode(), this._KV_NODE_CALL_TIMEOUT_MS, "KV init");
+      if (!this._kvBatcher) return false;
+
+      const streamId = this._toStreamId(streamIdString);
+      const keyBytes = new Uint8Array(Buffer.from(keyString, "utf-8"));
+      const valueBytes = new Uint8Array(Buffer.from(valueString, "utf-8"));
+
+      this._kvBatcher.streamDataBuilder.set(streamId, keyBytes, valueBytes);
+      const [tx, err] = await this._withTimeout(
+        this._kvBatcher.exec(),
+        this._KV_NODE_CALL_TIMEOUT_MS,
+        `KV write ${keyString}`
+      );
+      if (err) {
+        console.warn(`[KV Node] Write failed for ${streamIdString}/${keyString}: ${err.message || err}`);
+        this._kvNodeRecordFailure(err.message || String(err));
+        return false;
+      }
+      this._kvNodeRecordSuccess();
+      console.log(`[KV Node] Wrote ${streamIdString}/${keyString} (tx=${tx?.txHash?.slice(0, 10) || "?"}...)`);
+      return true;
+    } catch (err) {
+      console.warn(`[KV Node] Write exception for ${streamIdString}/${keyString}: ${err.message}`);
+      this._kvNodeRecordFailure(err.message);
+      return false;
+    }
+  }
+
+  /**
+   * Read a value from the 0G KV Node by streamId + key.
+   * Returns null on any failure (caller should fall back to existing behavior).
+   * Respects circuit breaker and applies aggressive timeout to prevent
+   * blocking the Telegraf polling loop.
+   * @param {string} streamIdString - Human-readable namespace
+   * @param {string} keyString      - Human-readable key
+   * @returns {Promise<string|null>} The stored string value, or null
+   */
+  async _kvNodeRead(streamIdString, keyString) {
+    // Circuit breaker check — skip entirely if KV Node is known to be down
+    if (this._kvNodeCircuitOpen()) return null;
+
+    try {
+      await this._withTimeout(this._initKvNode(), this._KV_NODE_CALL_TIMEOUT_MS, "KV init");
+      if (!this._kvClient) return null;
+
+      const streamId = this._toStreamId(streamIdString);
+      const keyBytes = new Uint8Array(Buffer.from(keyString, "utf-8"));
+      // KV Node RPC requires the key as a base64-encoded string
+      // (Uint8Array serializes to {0:..,1:..} which the server rejects with
+      // "invalid type: map, expected a string"). See 0G docs example:
+      //   kvClient.getValue(streamId, ethers.encodeBase64(keyBytes))
+      const keyB64 = encodeBase64(keyBytes);
+
+      const value = await this._withTimeout(
+        this._kvClient.getValue(streamId, keyB64),
+        this._KV_NODE_CALL_TIMEOUT_MS,
+        `KV read ${keyString}`
+      );
+      if (!value || !value.data) {
+        this._kvNodeRecordSuccess(); // reached the node, just no data
+        return null;
+      }
+
+      // value.data is Bytes — convert back to string
+      const bytes = typeof value.data === "string"
+        ? Buffer.from(value.data.replace(/^0x/, ""), "hex")
+        : Buffer.from(value.data);
+      this._kvNodeRecordSuccess();
+      return bytes.toString("utf-8");
+    } catch (err) {
+      console.warn(`[KV Node] Read exception for ${streamIdString}/${keyString}: ${err.message}`);
+      this._kvNodeRecordFailure(err.message);
+      return null;
+    }
+  }
+
+  // ─── SUPABASE FALLBACK LAYER ────────────────────────────────────────────
+  //
+  // Secondary persistence layer for KV pointers. The primary layer remains
+  // 0G KV Node — this only kicks in when 0G KV Node returns null (miss or
+  // not synced yet). Writes go to BOTH layers independently; reads prefer
+  // 0G KV Node and fall back here.
+  //
+  // Stores only small key→value pointers. Actual memory content lives on
+  // 0G Storage (immutable log layer via uploadData).
+
+  /**
+   * Write a key-value pair to the Supabase fallback table.
+   * Uses service role key to bypass RLS. Fire-and-forget; errors never
+   * propagate to the caller.
+   */
+  async _kvSupabaseWrite(streamIdString, keyString, valueString) {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) return false;
+    try {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/agent_kv_index`, {
+        method: "POST",
+        headers: {
+          apikey: SUPABASE_SERVICE_KEY,
+          Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+          "Content-Type": "application/json",
+          Prefer: "resolution=merge-duplicates,return=minimal",
+        },
+        body: JSON.stringify({
+          stream_id: streamIdString,
+          key: keyString,
+          value: valueString,
+          updated_at: new Date().toISOString(),
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        console.warn(`[KV Supabase] Write ${streamIdString}/${keyString} failed: HTTP ${res.status} ${body.slice(0, 100)}`);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      console.warn(`[KV Supabase] Write exception for ${streamIdString}/${keyString}: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Read a value from the Supabase fallback table.
+   * Returns null on miss or any error (caller already has other fallbacks).
+   */
+  async _kvSupabaseRead(streamIdString, keyString) {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) return null;
+    try {
+      const url = `${SUPABASE_URL}/rest/v1/agent_kv_index?stream_id=eq.${encodeURIComponent(streamIdString)}&key=eq.${encodeURIComponent(keyString)}&select=value`;
+      const res = await fetch(url, {
+        headers: {
+          apikey: SUPABASE_SERVICE_KEY,
+          Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+        },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) return null;
+      const rows = await res.json();
+      if (!rows?.length) return null;
+      return rows[0].value ?? null;
+    } catch (err) {
+      console.warn(`[KV Supabase] Read exception for ${streamIdString}/${keyString}: ${err.message}`);
+      return null;
+    }
   }
 
   /**
@@ -89,6 +409,11 @@ export class StorageService {
     }
 
     const outputPath = join(this.tmpDir, filename);
+
+    // 0G SDK requires output path to NOT exist — delete stale file if present
+    if (existsSync(outputPath)) {
+      try { unlinkSync(outputPath); } catch { /* ignore */ }
+    }
 
     console.log(`[Storage] Downloading ${rootHash}...`);
 
@@ -254,14 +579,26 @@ export class StorageService {
   async setKey(key, cid) {
     // NEW-2 FIX: Store in memory for immediate retrieval
     this._kvIndex.set(key, cid);
-    
+
     // Also upload to 0G Storage for persistence (best effort)
     const indexEntry = {
       key,
       cid,
       timestamp: Math.floor(Date.now() / 1000),
     };
-    return this.uploadData(indexEntry, `kv-${key.replace(/:/g, "-")}.json`);
+    const rootHash = await this.uploadData(indexEntry, `kv-${key.replace(/:/g, "-")}.json`);
+
+    // Option B: persist pointer to 0G KV Node for cross-restart recovery.
+    // Non-blocking and non-throwing — existing Map + log-layer flow above
+    // continues to work even if KV Node write fails.
+    this._kvNodeWrite("zer0gig:kv", key, cid).catch(() => {});
+
+    // Supabase fallback layer (Option B hybrid): mirror the pointer to
+    // agent_kv_index so cross-restart reads still resolve when 0G KV Node
+    // hasn't synced yet. Fire-and-forget; independent of KV Node success.
+    this._kvSupabaseWrite("zer0gig:kv", key, cid).catch(() => {});
+
+    return rootHash;
   }
 
   /**
@@ -276,7 +613,27 @@ export class StorageService {
     if (cid) {
       return cid;
     }
-    
+
+    // Option B fallback: look up pointer from 0G KV Node (cross-restart recovery).
+    // If KV Node returns a value, hydrate the in-memory Map so subsequent
+    // lookups are fast. If KV Node is unreachable, returns null (existing behavior).
+    const kvNodeCid = await this._kvNodeRead("zer0gig:kv", key);
+    if (kvNodeCid) {
+      this._kvIndex.set(key, kvNodeCid);
+      console.log(`[KV Node] Hydrated key=${key} from 0G KV Node`);
+      return kvNodeCid;
+    }
+
+    // Supabase fallback: query agent_kv_index when KV Node misses.
+    // This guarantees cross-restart recovery even while KV Node is still
+    // syncing the chain or is unavailable. Hydrate Map on hit.
+    const supaCid = await this._kvSupabaseRead("zer0gig:kv", key);
+    if (supaCid) {
+      this._kvIndex.set(key, supaCid);
+      console.log(`[KV Supabase] Hydrated key=${key} from Supabase fallback`);
+      return supaCid;
+    }
+
     // Fallback: try to load from 0G Storage (not implemented for demo)
     // In production, this would query an on-chain KV index
     return null;
@@ -348,6 +705,22 @@ export class StorageService {
     // Store the index's own root hash so kvListIndex can find it after restart
     this._kvIndex.set(`kv_index_root:${streamId}`, indexRootHash);
 
+    // Option B: persist the full KV entry to 0G KV Node for cross-restart recovery.
+    // We store the entry JSON directly (not just a CID pointer) so kvGet can
+    // retrieve the value without needing to download from the log layer.
+    // Non-blocking — existing flow above is unchanged.
+    try {
+      const serialized = JSON.stringify(entry);
+      this._kvNodeWrite(streamId, key, serialized).catch(() => {});
+      // Also persist the index root hash so kvListIndex can recover on restart
+      this._kvNodeWrite(`${streamId}:__index__`, "root", indexRootHash).catch(() => {});
+
+      // Supabase fallback: mirror full entry + index root hash.
+      // Reliable cross-restart recovery when 0G KV Node isn't synced yet.
+      this._kvSupabaseWrite(streamId, key, serialized).catch(() => {});
+      this._kvSupabaseWrite(`${streamId}:__index__`, "root", indexRootHash).catch(() => {});
+    } catch { /* never let KV Node errors break kvSet */ }
+
     return rootHash;
   }
 
@@ -364,6 +737,36 @@ export class StorageService {
     const memKey = `kv:${streamId}:${key}`;
     const cached = this._kvIndex.get(memKey);
     if (cached !== undefined) return cached;
+
+    // Option B: try 0G KV Node first (persistent across restarts).
+    // If found, rehydrate the in-memory cache and return quickly.
+    const kvNodeRaw = await this._kvNodeRead(streamId, key);
+    if (kvNodeRaw) {
+      try {
+        const parsed = JSON.parse(kvNodeRaw);
+        const value = parsed?.value ?? parsed;
+        this._kvIndex.set(memKey, value);
+        console.log(`[KV Node] kvGet hydrated ${streamId}/${key} from 0G KV Node`);
+        return value;
+      } catch {
+        // Fall through to Supabase fallback → existing log-layer path
+      }
+    }
+
+    // Supabase fallback: reliable cross-restart recovery when 0G KV Node
+    // hasn't synced yet. Stores the same serialized entry format as above.
+    const supaRaw = await this._kvSupabaseRead(streamId, key);
+    if (supaRaw) {
+      try {
+        const parsed = JSON.parse(supaRaw);
+        const value = parsed?.value ?? parsed;
+        this._kvIndex.set(memKey, value);
+        console.log(`[KV Supabase] kvGet hydrated ${streamId}/${key} from Supabase fallback`);
+        return value;
+      } catch {
+        // Fall through to existing log-layer path
+      }
+    }
 
     // Try to get from 0G via index
     try {
@@ -390,8 +793,28 @@ export class StorageService {
   async kvListIndex(streamId) {
     try {
       // Use the stored root hash — NOT the filename (filename isn't a valid 0G hash)
-      const indexRootHash = this._kvIndex.get(`kv_index_root:${streamId}`);
-      if (!indexRootHash) return {}; // No index uploaded yet this session
+      let indexRootHash = this._kvIndex.get(`kv_index_root:${streamId}`);
+
+      // Option B: if not in memory, try 0G KV Node (cross-restart recovery)
+      if (!indexRootHash) {
+        indexRootHash = await this._kvNodeRead(`${streamId}:__index__`, "root");
+        if (indexRootHash) {
+          // Rehydrate the in-memory cache so subsequent reads are fast
+          this._kvIndex.set(`kv_index_root:${streamId}`, indexRootHash);
+          console.log(`[KV Node] Index hydrated for stream ${streamId}`);
+        }
+      }
+
+      // Supabase fallback for the index root hash itself
+      if (!indexRootHash) {
+        indexRootHash = await this._kvSupabaseRead(`${streamId}:__index__`, "root");
+        if (indexRootHash) {
+          this._kvIndex.set(`kv_index_root:${streamId}`, indexRootHash);
+          console.log(`[KV Supabase] Index hydrated for stream ${streamId} from fallback`);
+        }
+      }
+
+      if (!indexRootHash) return {}; // No index uploaded yet
 
       const data = await this.downloadData(indexRootHash, `kv-index-${streamId.replace(/:/g, "-")}.json`);
       return data || {};
