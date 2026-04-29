@@ -96,18 +96,41 @@ async function main() {
 }
 
 function startHealthCheck(port = parseInt(process.env.PORT || "10000")) {
+  const bot = process.env.TELEGRAM_WEBHOOK_URL ? initTelegram() : null;
+
   const server = http.createServer((req, res) => {
     if (req.url === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok", service: "zer0gig-runtime-platform" }));
-    } else {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "not found" }));
+      return;
     }
+
+    // Telegram webhook endpoint — only active when TELEGRAM_WEBHOOK_URL is set
+    if (req.url === "/telegram-webhook" && req.method === "POST" && bot) {
+      let body = "";
+      req.on("data", chunk => { body += chunk; });
+      req.on("end", () => {
+        try {
+          const update = JSON.parse(body);
+          bot.handleUpdate(update)
+            .then(() => { res.writeHead(200).end("ok"); })
+            .catch(() => { res.writeHead(500).end("error"); });
+        } catch {
+          res.writeHead(400).end("bad request");
+        }
+      });
+      return;
+    }
+
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "not found" }));
   });
 
   server.listen(port, () => {
     console.log(`[HealthCheck] Listening on port ${port}`);
+    if (process.env.TELEGRAM_WEBHOOK_URL) {
+      console.log(`[Telegram] Webhook endpoint: POST ${process.env.TELEGRAM_WEBHOOK_URL}/telegram-webhook`);
+    }
   });
 
   return server;
