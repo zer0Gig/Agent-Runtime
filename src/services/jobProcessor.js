@@ -12,9 +12,31 @@
 import { ethers } from "ethers";
 
 const ESCROW_ABI = [
-  "function getJob(uint256 jobId) view returns (tuple(uint256 jobId, address client, uint256 agentId, address agentWallet, uint256 totalBudgetWei, uint256 releasedWei, uint8 status, tuple(uint8 percentage, uint256 amountWei, uint8 status, bytes32 criteriaHash, string outputCID, uint256 alignmentScore, uint256 retryCount, uint256 submittedAt, uint256 completedAt)[] milestones, uint256 createdAt, string jobDataCID, bytes32 skillId))",
-  "function releaseMilestone(uint256 jobId, uint8 milestoneIndex, string outputCID, uint256 alignmentScore, bytes signature) external",
+  "function getJob(uint256 jobId) view returns (tuple(address client, uint64 agentId, uint8 status, uint8 milestoneCount, address agentWallet, uint96 totalBudgetWei, uint96 releasedWei, uint64 createdAt, bytes32 skillId, bytes32 jobDataHash))",
+  "function getMilestones(uint256 jobId) view returns (tuple(uint96 amountWei, uint16 alignmentScore, uint8 percentage, uint8 retryCount, uint8 status, uint48 submittedAt, uint48 completedAt, bytes32 criteriaHash, bytes32 outputHash)[])",
+  "function releaseMilestone(uint256 jobId, uint8 milestoneIndex, bytes32 outputHash, uint16 alignmentScore, bytes signature) external",
 ];
+
+/**
+ * Fetch the off-chain job brief by its on-chain hash from Supabase.
+ * The contract stores only keccak256(content); content lives in public.jobs.
+ */
+async function fetchJobBriefByHash(jobDataHash) {
+  const sbUrl = process.env.SUPABASE_URL;
+  const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+  if (!sbUrl || !sbKey) return null;
+  try {
+    const res = await fetch(
+      `${sbUrl}/rest/v1/jobs?job_data_hash=eq.${jobDataHash}&select=title,description,metadata`,
+      { headers: { apikey: sbKey, Authorization: `Bearer ${sbKey}` } }
+    );
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return rows?.[0] ?? null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Emit an activity log entry to the frontend API.
@@ -28,13 +50,20 @@ export async function logActivity({ jobId, agentId, agentWallet, phase, message,
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
 
-    await fetch(activityUrl, {
+    const res = await fetch(activityUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ jobId, agentId, agentWallet, phase, message, milestoneIndex, metadata }, (_, v) => typeof v === "bigint" ? v.toString() : v),
       signal: controller.signal,
     });
     clearTimeout(timeout);
+
+    // fetch() resolves on HTTP errors (4xx/5xx) — surface them so a broken
+    // backend doesn't silently swallow every activity entry.
+    if (!res.ok) {
+      const bodyText = await res.text().catch(() => "");
+      console.warn(`[Processor] Activity log HTTP ${res.status} for job ${jobId} phase=${phase}: ${bodyText.slice(0, 200)}`);
+    }
   } catch (err) {
     console.log(`[Processor] Activity log failed: ${err.message}`);
   }
@@ -105,29 +134,54 @@ export class JobProcessor {
     try {
       console.log(`\n[Processor] ========== PROCESSING JOB ${id} ==========`);
 
-      // 1. Fetch job details from contract
-      const job = await this.escrow.getJob(jobId);
+      // 1. Fetch job details + milestones from contract (separate calls in new ABI)
+      const jobRaw = await this.escrow.getJob(jobId);
+      const milestones = await this.escrow.getMilestones(jobId);
+      // ethers Result objects are frozen — copy fields into a plain object so downstream code
+      // that does job.milestones[i].amountWei etc. keeps working without mutation.
+      const job = {
+        client: jobRaw.client,
+        agentId: jobRaw.agentId,
+        status: jobRaw.status,
+        milestoneCount: jobRaw.milestoneCount,
+        agentWallet: jobRaw.agentWallet,
+        totalBudgetWei: jobRaw.totalBudgetWei,
+        releasedWei: jobRaw.releasedWei,
+        createdAt: jobRaw.createdAt,
+        skillId: jobRaw.skillId,
+        jobDataHash: jobRaw.jobDataHash,
+        milestones,
+      };
+
       console.log(`[Processor] Client: ${job.client}`);
       console.log(`[Processor] Budget: ${ethers.formatEther(job.totalBudgetWei)} OG`);
-      console.log(`[Processor] Milestones: ${job.milestones.length}`);
-      console.log(`[Processor] Job Data CID: ${job.jobDataCID}`);
+      console.log(`[Processor] Milestones: ${milestones.length} (count=${job.milestoneCount})`);
+      console.log(`[Processor] Job Data Hash: ${job.jobDataHash}`);
 
-      // 2. Download job brief from 0G Storage
+      // 2. Fetch job brief from Supabase (keyed by on-chain hash) — contract only stores the hash
       let jobBrief;
       try {
         await logActivity({
           jobId, agentId: job.agentId.toString(), agentWallet: job.agentWallet,
-          phase: "downloading_brief", message: "Downloading job brief from 0G Storage...",
+          phase: "fetching_brief", message: "Fetching job brief by hash from Supabase...",
         });
-        console.log("[Processor] Downloading job brief from 0G Storage...");
-        jobBrief = await this.storage.downloadData(job.jobDataCID, `job-${id}-brief.json`);
-        console.log("[Processor] Job brief downloaded.");
-        await logActivity({
-          jobId, agentId: job.agentId.toString(), agentWallet: job.agentWallet,
-          phase: "brief_downloaded", message: `Job brief downloaded (${JSON.stringify(jobBrief).length} bytes)`,
-        });
+        const briefRow = await fetchJobBriefByHash(job.jobDataHash);
+        if (briefRow) {
+          jobBrief = {
+            title: briefRow.title,
+            description: briefRow.description,
+            ...(briefRow.metadata || {}),
+          };
+          console.log(`[Processor] Brief found: "${briefRow.title || '(no title)'}" — ${(briefRow.description || '').length} chars`);
+          await logActivity({
+            jobId, agentId: job.agentId.toString(), agentWallet: job.agentWallet,
+            phase: "brief_loaded", message: `Brief: ${briefRow.title || 'untitled'}`,
+          });
+        } else {
+          throw new Error("No brief found for this jobDataHash");
+        }
       } catch (err) {
-        console.log(`[Processor] Could not download brief: ${err.message}`);
+        console.log(`[Processor] Could not fetch brief: ${err.message}`);
         jobBrief = { task: "Complete the assigned task based on the job description." };
         await logActivity({
           jobId, agentId: job.agentId.toString(), agentWallet: job.agentWallet,
@@ -136,8 +190,8 @@ export class JobProcessor {
       }
 
       // 3. Process each pending milestone
-      for (let i = 0; i < job.milestones.length; i++) {
-        const milestone = job.milestones[i];
+      for (let i = 0; i < milestones.length; i++) {
+        const milestone = milestones[i];
 
         // 0 = PENDING, skip if not pending
         if (milestone.status !== 0n && milestone.status !== 0) {
@@ -322,17 +376,20 @@ Deliver your work now:`;
    * Sign an alignment result (demo mode: self-sign with verifier key)
    * In production, the 0G Alignment Node network generates this signature
    */
-  async _signAlignmentResult(jobId, milestoneIndex, alignmentScore, outputCID) {
+  async _signAlignmentResult(jobId, milestoneIndex, alignmentScore, outputHash) {
     if (!this.alignmentVerifierKey) {
       throw new Error("No alignment verifier key configured");
     }
 
     const verifierWallet = new ethers.Wallet(this.alignmentVerifierKey);
 
-    // Must match the hash format in ProgressiveEscrow._verifyAlignmentSignature
-    const messageHash = ethers.solidityPackedKeccak256(
-      ["uint256", "uint8", "uint256", "string"],
-      [jobId, milestoneIndex, alignmentScore, outputCID]
+    // Must match the hash format in ProgressiveEscrow._verifyAlignmentSignature:
+    // abi.encode(uint256 jobId, uint8 milestoneIdx, uint16 score, bytes32 outputHash)
+    const messageHash = ethers.keccak256(
+      ethers.AbiCoder.defaultAbiCoder().encode(
+        ["uint256", "uint8", "uint16", "bytes32"],
+        [jobId, milestoneIndex, alignmentScore, outputHash]
+      )
     );
 
     const signature = await verifierWallet.signMessage(ethers.getBytes(messageHash));
