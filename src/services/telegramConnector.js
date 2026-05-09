@@ -185,20 +185,78 @@ function getBot() {
 
   // Launch: webhook (prod) or polling (dev)
   if (process.env.TELEGRAM_WEBHOOK_URL) {
-    _bot.telegram
-      .setWebhook(`${process.env.TELEGRAM_WEBHOOK_URL}/telegram-webhook`)
-      .then(() => console.log("[Telegram] Webhook registered."));
+    const url    = `${process.env.TELEGRAM_WEBHOOK_URL.replace(/\/$/, "")}/telegram-webhook`;
+    const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
+
+    if (!secret) {
+      console.warn("[Telegram] TELEGRAM_WEBHOOK_SECRET not set — webhook will accept unauthenticated requests. Set this for prod.");
+    }
+
+    (async () => {
+      try {
+        // Drop any prior webhook + pending updates to avoid duplicate handlers
+        await _bot.telegram.deleteWebhook({ drop_pending_updates: true });
+        await _bot.telegram.setWebhook(url, {
+          drop_pending_updates: true,
+          ...(secret ? { secret_token: secret } : {}),
+        });
+
+        // Verify registration
+        const info = await _bot.telegram.getWebhookInfo();
+        if (info.url === url) {
+          console.log(`[Telegram] Webhook verified at ${info.url}${info.has_custom_certificate ? " (custom cert)" : ""}`);
+          if (info.last_error_message) {
+            console.warn(`[Telegram] Last delivery error from Telegram: ${info.last_error_message} (at ${info.last_error_date})`);
+          }
+        } else {
+          console.error(`[Telegram] Webhook URL mismatch. Expected ${url}, got ${info.url || "(empty)"}`);
+        }
+      } catch (err) {
+        console.error(`[Telegram] Webhook registration failed: ${err.message}`);
+      }
+    })();
     console.log("[Telegram] Webhook mode.");
   } else {
-    _bot.launch({ dropPendingUpdates: false });
+    // Polling mode — bot.launch() returns a promise that rejects on fatal errors (e.g. 409 conflict)
+    _bot.launch({ dropPendingUpdates: false }).catch((err) => {
+      if (err?.response?.error_code === 409) {
+        console.warn("[Telegram] 409 Conflict — another instance is polling this token. Stopping duplicate.");
+      } else {
+        console.error(`[Telegram] Polling error: ${err.message}`);
+      }
+      _bot = null;
+    });
     console.log("[Telegram] Polling mode (dev).");
   }
 
   // Graceful shutdown
-  process.once("SIGINT", () => _bot.stop("SIGINT"));
-  process.once("SIGTERM", () => _bot.stop("SIGTERM"));
+  process.once("SIGINT", () => _bot && _bot.stop("SIGINT"));
+  process.once("SIGTERM", () => _bot && _bot.stop("SIGTERM"));
 
   return _bot;
+}
+
+/**
+ * Diagnostic helper — returns current bot status for /health endpoint or logs.
+ */
+export async function getBotStatus() {
+  if (!_bot) return { active: false, mode: null };
+  const mode = process.env.TELEGRAM_WEBHOOK_URL ? "webhook" : "polling";
+  if (mode === "webhook") {
+    try {
+      const info = await _bot.telegram.getWebhookInfo();
+      return {
+        active: !!info.url,
+        mode,
+        url: info.url || null,
+        pendingUpdateCount: info.pending_update_count ?? 0,
+        lastError: info.last_error_message || null,
+      };
+    } catch (err) {
+      return { active: false, mode, error: err.message };
+    }
+  }
+  return { active: true, mode };
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────

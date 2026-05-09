@@ -12,7 +12,7 @@ import "dotenv/config";
 import http from "http";
 import { ethers } from "ethers";
 import { PlatformDispatcher } from "./services/platformDispatcher.js";
-import { initTelegram } from "./services/telegramConnector.js";
+import { initTelegram, getBotStatus } from "./services/telegramConnector.js";
 
 async function main() {
   console.log("╔══════════════════════════════════════════════════╗");
@@ -39,6 +39,16 @@ async function main() {
     ? process.env.PLATFORM_AGENT_IDS.split(",")
     : [];
 
+  // Parse AGENT_WALLET_KEYS — format "agentId:privKey,agentId:privKey"
+  // Each agent's privKey signs releaseMilestone (contract requires msg.sender == job.agentWallet).
+  const agentWalletKeys = {};
+  if (process.env.AGENT_WALLET_KEYS) {
+    for (const entry of process.env.AGENT_WALLET_KEYS.split(",")) {
+      const [id, key] = entry.trim().split(":");
+      if (id && key) agentWalletKeys[id.trim()] = key.trim();
+    }
+  }
+
   // ── Setup provider & wallet ──────────────────────────────────
   const rpcUrl = process.env.OG_NEWTON_RPC || "https://evmrpc-testnet.0g.ai";
   const provider = new ethers.JsonRpcProvider(rpcUrl);
@@ -52,6 +62,7 @@ async function main() {
   console.log(`[Platform] Balance:           ${ethers.formatEther(balance)} OG`);
   console.log(`[Platform] Block:             ${blockNumber}`);
   console.log(`[Platform] Managed Agents:    ${managedIds.length > 0 ? managedIds.join(", ") : "(auto-discover)"}`);
+  console.log(`[Platform] Agent Wallet Keys: ${Object.keys(agentWalletKeys).length > 0 ? Object.keys(agentWalletKeys).join(", ") : (process.env.AGENT_PRIVATE_KEY ? "(single via AGENT_PRIVATE_KEY)" : "(NONE — releaseMilestone will revert)")}`);
   console.log(`[Platform] ProgressiveEscrow: ${process.env.PROGRESSIVE_ESCROW_ADDRESS}`);
   console.log(`[Platform] SubscriptionEscrow:${process.env.SUBSCRIPTION_ESCROW_ADDRESS || "(fallback to ProgressiveEscrow)"}`);
   console.log();
@@ -72,7 +83,8 @@ async function main() {
     registryAddress: process.env.AGENT_REGISTRY_ADDRESS,
     escrowAddress: process.env.PROGRESSIVE_ESCROW_ADDRESS,
     subscriptionEscrowAddress: process.env.SUBSCRIPTION_ESCROW_ADDRESS,
-    managedAgentIds: managedIds
+    managedAgentIds: managedIds,
+    agentWalletKeys
   });
 
   // ── Start Listening ──────────────────────────────────────────
@@ -92,21 +104,42 @@ async function main() {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT",  () => shutdown("SIGINT"));
 
-  startHealthCheck();
+  startHealthCheck(undefined, dispatcher);
 }
 
-function startHealthCheck(port = parseInt(process.env.PORT || "10000")) {
-  const bot = process.env.TELEGRAM_WEBHOOK_URL ? initTelegram() : null;
+function startHealthCheck(port = parseInt(process.env.PORT || "10000"), dispatcher = null) {
+  const bot           = process.env.TELEGRAM_WEBHOOK_URL ? initTelegram() : null;
+  const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET || null;
 
   const server = http.createServer((req, res) => {
     if (req.url === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", service: "zer0gig-runtime-platform" }));
+      Promise.resolve(bot ? getBotStatus() : { active: false, mode: null }).then((tg) => {
+        const kv = dispatcher?.storage?.getKvHealth ? dispatcher.storage.getKvHealth() : null;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          status: "ok",
+          service: "zer0gig-runtime-platform",
+          telegram: tg,
+          kvNode: kv,
+        }));
+      }).catch(() => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok", service: "zer0gig-runtime-platform" }));
+      });
       return;
     }
 
     // Telegram webhook endpoint — only active when TELEGRAM_WEBHOOK_URL is set
     if (req.url === "/telegram-webhook" && req.method === "POST" && bot) {
+      // Validate secret token (Telegram sends it as X-Telegram-Bot-Api-Secret-Token)
+      if (webhookSecret) {
+        const got = req.headers["x-telegram-bot-api-secret-token"];
+        if (got !== webhookSecret) {
+          res.writeHead(401).end("unauthorized");
+          return;
+        }
+      }
+
       let body = "";
       req.on("data", chunk => { body += chunk; });
       req.on("end", () => {
@@ -114,7 +147,10 @@ function startHealthCheck(port = parseInt(process.env.PORT || "10000")) {
           const update = JSON.parse(body);
           bot.handleUpdate(update)
             .then(() => { res.writeHead(200).end("ok"); })
-            .catch(() => { res.writeHead(500).end("error"); });
+            .catch((err) => {
+              console.error(`[Telegram] handleUpdate error: ${err.message}`);
+              res.writeHead(500).end("error");
+            });
         } catch {
           res.writeHead(400).end("bad request");
         }

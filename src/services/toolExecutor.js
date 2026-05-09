@@ -8,6 +8,7 @@
  */
 
 import { TOOL_TYPES } from "../schemas/capabilitySchema.js";
+import { decrypt as eciesDecrypt } from "eciesjs";
 
 const SUPABASE_URL  = process.env.SUPABASE_URL  || process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_KEY  = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
@@ -61,7 +62,7 @@ async function resolveSkills(agentId, prebuiltSkillIds = []) {
  * web_search — uses Serper.dev REST API if an apiKey is configured.
  */
 async function builtinWebSearch(skill, jobBrief) {
-  const apiKey = skill.config?.apiKey;
+  const apiKey = decryptApiKey(skill.config?.apiKey);
   if (!apiKey) {
     // Fallback: use DuckDuckGo instant answer API (no key needed)
     const q = typeof jobBrief === "string" ? jobBrief : `${jobBrief.title || ""} ${jobBrief.description || ""}`;
@@ -118,7 +119,7 @@ async function builtinHttpFetch(skill, jobBrief) {
  * github_reader — reads a file or directory listing from a GitHub repo.
  */
 async function builtinGithubReader(skill, jobBrief) {
-  const token = skill.config?.token;
+  const token = decryptApiKey(skill.config?.token);
   const repo = skill.config?.repo || jobBrief.metadata?.githubRepo;
   if (!repo) return "[github_reader] No repo configured.";
 
@@ -140,7 +141,7 @@ async function builtinGithubReader(skill, jobBrief) {
  * telegram_notify — sends a message to the agent's configured Telegram chat.
  */
 async function builtinTelegramNotify(skill, jobBrief) {
-  const token = skill.config?.botToken || process.env.TELEGRAM_BOT_TOKEN;
+  const token = decryptApiKey(skill.config?.botToken) || process.env.TELEGRAM_BOT_TOKEN;
   const chatId = skill.config?.chatId;
   if (!token || !chatId) return "[telegram_notify] Bot token or chatId not configured.";
 
@@ -251,7 +252,7 @@ async function builtinCodeExec(skill, jobBrief) {
  *   }
  */
 async function builtinMarketAnalysis(skill, jobBrief) {
-  const apiKey = skill.config?.apiKey || process.env.ALPACA_API_KEY || process.env.POLYGON_API_KEY;
+  const apiKey = decryptApiKey(skill.config?.apiKey) || process.env.ALPACA_API_KEY || process.env.POLYGON_API_KEY;
   const provider = skill.config?.provider || "alpaca";
   const symbols = skill.config?.symbols || jobBrief.metadata?.symbols || ["AAPL"];
   const timeframe = skill.config?.timeframe || "1D";
@@ -316,8 +317,8 @@ async function builtinMarketAnalysis(skill, jobBrief) {
  *   { orderExecution: { symbol, quantity, side, type, limitPrice? } }
  */
 async function builtinOrderExecution(skill, jobBrief) {
-  const apiKey = skill.config?.apiKey || process.env.ALPACA_API_KEY;
-  const secretKey = skill.config?.secretKey || process.env.ALPACA_SECRET_KEY;
+  const apiKey = decryptApiKey(skill.config?.apiKey) || process.env.ALPACA_API_KEY;
+  const secretKey = decryptApiKey(skill.config?.secretKey) || process.env.ALPACA_SECRET_KEY;
   const paper = skill.config?.paper !== false; // Default to paper trading
   const maxOrderValue = skill.config?.maxOrderValue || 1000;
 
@@ -396,7 +397,7 @@ async function builtinOrderExecution(skill, jobBrief) {
  *   }
  */
 async function builtinChartPatterns(skill, jobBrief) {
-  const apiKey = skill.config?.apiKey || process.env.POLYGON_API_KEY || process.env.ALPACA_API_KEY;
+  const apiKey = decryptApiKey(skill.config?.apiKey) || process.env.POLYGON_API_KEY || process.env.ALPACA_API_KEY;
   const provider = skill.config?.provider || "polygon";
   const symbols = skill.config?.symbols || jobBrief.metadata?.symbols || ["AAPL"];
   const indicators = skill.config?.indicators || ["RSI", "MACD", "BB"];
@@ -548,7 +549,7 @@ function calculateBollingerBands(prices, period = 20, stdDev = 2) {
  *   }
  */
 async function builtinRiskManagement(skill, jobBrief) {
-  const apiKey = skill.config?.apiKey || process.env.ALPACA_API_KEY;
+  const apiKey = decryptApiKey(skill.config?.apiKey) || process.env.ALPACA_API_KEY;
   const secretKey = process.env.ALPACA_SECRET_KEY;
   const maxPositionSize = skill.config?.maxPositionSize || 0.3;
   const maxDrawdown = skill.config?.maxDrawdown || 0.1;
@@ -618,6 +619,63 @@ async function builtinRiskManagement(skill, jobBrief) {
   }
 }
 
+/**
+ * email_send — sends email via SMTP (Gmail App Password, Outlook, custom SMTP).
+ *
+ * skill.config requires: { smtpHost, smtpPort, user, password, from, to }
+ * Optional: { secure (default port-based), subject, body, replyTo }
+ *
+ * For Gmail: smtpHost="smtp.gmail.com", smtpPort=465, secure=true,
+ * user="you@gmail.com", password="<16-char App Password>" — see
+ * https://myaccount.google.com/apppasswords
+ *
+ * The job brief is used to compose the body when subject/body aren't provided
+ * (LLM-generated transactional notification).
+ */
+async function builtinEmailSend(skill, jobBrief) {
+  const cfg = skill.config || {};
+  const required = ["smtpHost", "smtpPort", "user", "password", "from", "to"];
+  const missing = required.filter(k => !cfg[k]);
+  if (missing.length) {
+    return `[email_send] Missing config: ${missing.join(", ")}. For Gmail use smtp.gmail.com:465 with an App Password.`;
+  }
+
+  let nodemailer;
+  try {
+    nodemailer = await import("nodemailer");
+  } catch {
+    return `[email_send] nodemailer not installed. Run: npm install nodemailer`;
+  }
+
+  try {
+    const transporter = nodemailer.createTransport({
+      host: cfg.smtpHost,
+      port: Number(cfg.smtpPort),
+      secure: cfg.secure ?? Number(cfg.smtpPort) === 465,
+      auth: { user: cfg.user, pass: decryptApiKey(cfg.password) },
+    });
+
+    const subject = cfg.subject
+      || (typeof jobBrief === "object" ? jobBrief.title : null)
+      || "Notification from your zer0Gig agent";
+    const body = cfg.body
+      || (typeof jobBrief === "object" ? jobBrief.description : String(jobBrief))
+      || "(no body provided)";
+
+    const info = await transporter.sendMail({
+      from: cfg.from,
+      to: cfg.to,
+      replyTo: cfg.replyTo,
+      subject: subject.slice(0, 200),
+      text: String(body).slice(0, 5000),
+    });
+
+    return `[email_send] Sent to ${cfg.to} — messageId=${info.messageId}`;
+  } catch (err) {
+    return `[email_send] Failed: ${err.message?.slice(0, 200)}`;
+  }
+}
+
 /** Dispatch to the correct builtin handler. */
 async function executeBuiltinSkill(skill, jobBrief) {
   const id = skill.id || skill.skill_id || "";
@@ -632,6 +690,7 @@ async function executeBuiltinSkill(skill, jobBrief) {
     case "order_execution":   return builtinOrderExecution(skill, jobBrief);
     case "chart_patterns":    return builtinChartPatterns(skill, jobBrief);
     case "risk_management":   return builtinRiskManagement(skill, jobBrief);
+    case "email_send":        return builtinEmailSend(skill, jobBrief);
     default:
       console.warn(`[ToolExecutor] No handler for builtin skill: ${id}`);
       return `[${id}] Builtin handler not implemented yet.`;
@@ -852,24 +911,36 @@ export async function executeMcpTool(tool, jobBrief) {
   }
 }
 
-// ─── API KEY DECRYPTION (STUB) ──────────────────────────────────────────────
+// ─── API KEY DECRYPTION (ECIES) ─────────────────────────────────────────────
 
 /**
- * Decrypts an API key stored in the capability manifest.
- * In production, this uses ECIES decryption with the agent's private key.
- * For the hackathon demo, we assume keys are stored in plaintext or a simple format.
- * 
- * @param {string} encryptedApiKey - The key to decrypt.
- * @returns {string} The plaintext API key.
+ * Decrypts a skill-config secret. Plaintext values pass through (legacy rows).
+ * Encrypted values are hex blobs prefixed with `0x`, generated by the
+ * frontend's `encryptSkillConfig` using the platform public key.
+ *
+ * @param {string} value - Plaintext or `0x`-prefixed ECIES blob.
+ * @returns {string} The plaintext secret, or "" on missing input / decrypt failure.
  */
-export function decryptApiKey(encryptedApiKey) {
-  if (!encryptedApiKey) return "";
-  
-  // Check if it looks like an ECIES encrypted blob (starts with 0x...)
-  // For demo, we just return it as-is and warn if it's not a standard SK- prefix
-  if (encryptedApiKey.startsWith("0x") && encryptedApiKey.length > 100) {
-    console.warn("[ToolExecutor] ECIES encrypted key detected. Using stub decryption (returns key as-is).");
+export function decryptApiKey(value) {
+  if (!value) return "";
+  // Heuristic: encrypted blobs are always >200 hex chars after `0x`.
+  if (typeof value !== "string" || !value.startsWith("0x") || value.length < 200) {
+    return value;
   }
-  
-  return encryptedApiKey;
+
+  const sk = process.env.PLATFORM_ENCRYPTION_PRIVATE_KEY;
+  if (!sk) {
+    console.warn("[ToolExecutor] PLATFORM_ENCRYPTION_PRIVATE_KEY not set — cannot decrypt skill config. Run setup-encryption-keys.js.");
+    return "";
+  }
+
+  try {
+    const skHex   = sk.startsWith("0x") ? sk.slice(2) : sk;
+    const cipher  = Buffer.from(value.slice(2), "hex");
+    const plain   = eciesDecrypt(skHex, cipher);
+    return Buffer.from(plain).toString("utf8");
+  } catch (err) {
+    console.error(`[ToolExecutor] Skill config decrypt failed: ${err.message}`);
+    return "";
+  }
 }

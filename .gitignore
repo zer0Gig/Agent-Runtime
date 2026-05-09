@@ -27,3 +27,6 @@ platform-*.log
 
 # Temp
 .tmp/
+
+.runtime-log.txt
+.dev-log.txt

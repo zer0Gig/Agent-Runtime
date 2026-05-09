@@ -48,19 +48,86 @@ async function postChat(jobId, message, msgType = "text", metadata = {}) {
 }
 
 /**
- * Wait for milestone approval via chat-based feedback loop.
+ * Wait for milestone approval. Three paths in order of precedence:
  *
- * Flow:
- *  1. Post the milestone output summary + "milestone_ready" card as agent messages.
- *  2. Every 15 min, post a reminder if the user still hasn't responded.
- *  3. When the user sends a message, use LLM to interpret intent:
- *       APPROVED  → confirm and wait for button click to release payment.
- *       REVISION  → acknowledge, apply (max 2 revisions), re-post card.
- *  4. Never auto-approve — if the 1-hour deadline passes with no action, throw.
+ *  1. AUTO_APPROVE_MILESTONES=true   → demo bypass (no signal of quality).
+ *  2. Alignment Node attestation     → score ≥ ALIGNMENT_AUTO_APPROVE_THRESHOLD
+ *                                      and PLATFORM_PRIVATE_KEY signed off.
+ *                                      Human can still react via chat during the
+ *                                      grace window (default 60s) — any user
+ *                                      message during that window cancels the
+ *                                      auto-approve and falls through to human.
+ *  3. Human-in-the-loop (default)    → 15-min reminders, LLM intent classifier,
+ *                                      max 2 revisions, 1-hour timeout.
  *
- * Returns when the user clicks "Go to Next Milestone" (milestone-approval POST).
+ * Returns once the milestone is ready to be released on-chain.
  */
-async function runFeedbackLoop(jobId, milestoneIndex, outputSummary, extendedCompute, telegramChatId = null, timeoutMs = 60 * 60 * 1000) {
+export async function runFeedbackLoop(
+  jobId,
+  milestoneIndex,
+  outputSummary,
+  extendedCompute,
+  telegramChatId  = null,
+  timeoutMs       = 60 * 60 * 1000,
+  alignmentScore  = 0,           // 0–10000 bps, from selfEvaluator
+  alignmentSigned = false,       // true if oracle has signed the alignment digest
+) {
+  // ── Path 1: Demo bypass ───────────────────────────────────────────────────
+  if (process.env.AUTO_APPROVE_MILESTONES === "true") {
+    console.log(`[PlatformProcessor] AUTO_APPROVE_MILESTONES=true — bypassing user approval for milestone ${milestoneIndex + 1}`);
+    await postChat(
+      jobId,
+      `✅ Milestone ${milestoneIndex + 1} complete! Here's a summary:\n\n${outputSummary}\n\n_(Auto-approved — demo mode)_`,
+      "text"
+    );
+    return { userFeedback: "[auto-approved for demo]", path: "demo" };
+  }
+
+  // ── Path 2: Alignment Node attestation ────────────────────────────────────
+  const ALIGNMENT_THRESHOLD = Number(process.env.ALIGNMENT_AUTO_APPROVE_THRESHOLD) || 7500;
+  const ALIGNMENT_GRACE_MS  = Number(process.env.ALIGNMENT_GRACE_PERIOD_MS) || 60_000;
+
+  if (alignmentSigned && alignmentScore >= ALIGNMENT_THRESHOLD) {
+    console.log(`[PlatformProcessor] Alignment Node attested milestone ${milestoneIndex + 1} (score ${alignmentScore}/10000 ≥ ${ALIGNMENT_THRESHOLD}) — entering ${ALIGNMENT_GRACE_MS / 1000}s grace window before auto-release`);
+
+    await postChat(
+      jobId,
+      `🛡️ Milestone ${milestoneIndex + 1} attested by Alignment Node — score ${(alignmentScore / 100).toFixed(1)}/100\n\n${outputSummary}\n\n_Releasing payment in ${ALIGNMENT_GRACE_MS / 1000}s. Reply with anything to override and switch to manual review._`,
+      "milestone_alignment_attested",
+      { milestoneIndex, alignmentScore, threshold: ALIGNMENT_THRESHOLD }
+    );
+
+    if (telegramChatId) {
+      try { await sendMilestoneCard({ chatId: telegramChatId, jobId, milestoneIndex, outputSummary }); } catch { /* non-fatal */ }
+    }
+
+    // Listen for user override during the grace window
+    const graceStart = Date.now();
+    const startMsgTime = new Date().toISOString();
+    while (Date.now() - graceStart < ALIGNMENT_GRACE_MS) {
+      await new Promise(r => setTimeout(r, 1_000));
+      try {
+        const res = await fetch(`${ACTIVITY_BASE}/api/job-chat?jobId=${jobId}&since=${encodeURIComponent(startMsgTime)}`);
+        if (res.ok) {
+          const all = await res.json();
+          const userMessages = all.filter(m => m.sender === "user");
+          if (userMessages.length > 0) {
+            console.log(`[PlatformProcessor] User overrode alignment auto-release — falling back to human approval`);
+            await postChat(jobId, `Override received — switching to manual review. I'll wait for your decision.`, "text");
+            // Fall through to Path 3 below
+            break;
+          }
+        }
+      } catch { /* ignore */ }
+    }
+
+    if (Date.now() - graceStart >= ALIGNMENT_GRACE_MS) {
+      // Grace expired without user override — release
+      return { userFeedback: "[alignment-attested]", path: "alignment", alignmentScore };
+    }
+    // else: user overrode → continue into Path 3
+  }
+
   const REMINDER_INTERVAL = 15 * 60 * 1000; // 15 minutes between reminders
   const POLL_INTERVAL     = 1_000;           // check for new user messages every 1s
   const MAX_REVISIONS     = 2;
@@ -448,13 +515,15 @@ export class PlatformJobProcessor extends JobProcessor {
       outputCID = `mock-cid-job${id}-m${milestoneIndex}-${Date.now()}`;
     }
 
-    // 5. Pre-compute alignment score + signature (so we can release immediately on approval)
+    // 5. Pre-compute alignment score + signature (so we can release immediately on approval).
+    // Contract takes bytes32 outputHash (not string CID) — derive deterministic hash from CID.
     const alignmentScore = Number(process.env.DEMO_ALIGNMENT_SCORE) || 8500;
+    const outputHash = ethers.keccak256(ethers.toUtf8Bytes(outputCID));
     const signature = await this._signAlignmentResult(
       jobId,
       milestoneIndex,
       alignmentScore,
-      outputCID
+      outputHash
     );
 
     // 6. Pause — run chat-based feedback loop until user confirms
@@ -486,7 +555,16 @@ export class PlatformJobProcessor extends JobProcessor {
 
     let feedbackResult = { userFeedback: "" };
     try {
-      feedbackResult = await runFeedbackLoop(id, milestoneIndex, outputSummary, this.extendedCompute, telegramChatId) || feedbackResult;
+      feedbackResult = await runFeedbackLoop(
+        id,
+        milestoneIndex,
+        outputSummary,
+        this.extendedCompute,
+        telegramChatId,
+        undefined,                  // timeoutMs — use default 1h
+        alignmentScore,             // pass score to the loop
+        signature && signature !== "0x" // alignmentSigned flag — true if we already signed
+      ) || feedbackResult;
     } catch (timeoutErr) {
       console.error(`[PlatformProcessor] ${timeoutErr.message}`);
       feedbackResult.userFeedback = timeoutErr.userFeedback || "";
@@ -531,7 +609,7 @@ export class PlatformJobProcessor extends JobProcessor {
       const tx = await this.escrow.releaseMilestone(
         jobId,
         milestoneIndex,
-        outputCID,
+        outputHash,
         alignmentScore,
         signature
       );

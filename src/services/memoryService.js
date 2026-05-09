@@ -1,16 +1,26 @@
 /**
- * Agent Memory Service — 0G Storage Backed
+ * Agent Memory Service — 0G Storage Backed (3-layer persistence)
  *
- * Persists agent learnings across jobs using 0G Storage:
- * - Immutable log layer: Each memory saved as independent file on 0G with Merkle proof
- * - KV layer: Fast lookup index maps client+jobType → latest memory CID
- * - LLM extraction: Feedback analyzed for actionable learnings & preferences
+ * Persists agent learnings across jobs and runtime restarts.
  *
- * Flow:
+ * ── Persistence layers (in order of read preference) ─────────────────────────
+ *   1. In-memory cache    — Map; instant lookup; lost on restart
+ *   2. 0G KV Node         — http://localhost:6789 by default; mutable index;
+ *                           circuit breaker opens after 2 failures (skips for 5min)
+ *   3. Supabase fallback  — agent_kv_index table; safety net when KV is down/cold
+ *
+ * Recall path: cache → KV → Supabase → null
+ * Save path:   parallel writes to all three layers + 0G Storage immutable log
+ *
+ * The "cid" returned by save() is the 0G Storage Merkle root of the memory blob.
+ * The KV/Supabase rows hold {cid, timestamp} pointers, not the full blob.
+ *
+ * ── Flow ─────────────────────────────────────────────────────────────────────
  *   Job starts → recall(clientAddress, jobType) → inject into LLM context
- *   Job ends   → save({ clientAddress, jobId, jobType, outcomeScore, chatFeedback }) → 0G Storage
+ *   Job ends   → save({ clientAddress, jobId, jobType, outcomeScore, chatFeedback })
  *
- * Data survives agent restarts — all data is on 0G, not in memory.
+ * Cross-restart proof: e2e-memory-persistence.js (kills runtime, restarts,
+ * verifies recall hits Supabase fallback and logs "Memory injected for client...").
  */
 
 export class MemoryService {

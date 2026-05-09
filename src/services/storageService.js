@@ -52,14 +52,23 @@ export class StorageService {
     this._kvBatcher = null;   // Batcher for writes (needs StorageNode[] + FlowContract)
     this._kvInitPromise = null; // Deduplicate concurrent init attempts
 
-    // Circuit breaker state — if KV Node endpoint is unreachable, stop
-    // hitting it for N minutes. Prevents the bot from stalling on every
-    // message when the KV Node IP is down or blocked by firewall.
-    this._kvNodeFailures = 0;
-    this._kvNodeDisabledUntil = 0; // Unix ms timestamp
-    this._KV_NODE_FAILURE_THRESHOLD = 2;      // open circuit after N failures
-    this._KV_NODE_DISABLE_WINDOW_MS = 5 * 60 * 1000; // keep circuit open for 5 min
-    this._KV_NODE_CALL_TIMEOUT_MS = 3000;     // per-call timeout
+    // Circuit breaker — three states (closed | open | half-open). Each open
+    // doubles the cooldown window (5m → 10m → 20m), capped at 30m, so a
+    // permanently down KV Node doesn't waste retries. After cooldown, the
+    // next request is a probe; success closes the circuit, failure re-opens
+    // with the next-step cooldown.
+    this._kvNodeState           = "closed";  // "closed" | "open" | "half-open"
+    this._kvNodeFailures        = 0;
+    this._kvNodeDisabledUntil   = 0;          // Unix ms timestamp
+    this._kvNodeCooldownMs      = 5 * 60 * 1000;
+    this._kvNodeOpenCount       = 0;          // tracks consecutive open cycles
+    this._kvNodeLastError       = null;
+    this._kvNodeLastSuccessAt   = 0;
+    this._KV_NODE_FAILURE_THRESHOLD  = 2;
+    this._KV_NODE_BASE_COOLDOWN_MS   = 5 * 60 * 1000;
+    this._KV_NODE_MAX_COOLDOWN_MS    = 30 * 60 * 1000;
+    this._KV_NODE_CALL_TIMEOUT_MS    = 3000;
+    this._KV_NODE_RETRY_DELAYS_MS    = [200, 800];  // 1 retry @200ms, 2nd @800ms
 
     if (!existsSync(this.tmpDir)) {
       mkdirSync(this.tmpDir, { recursive: true });
@@ -145,39 +154,107 @@ export class StorageService {
   }
 
   /**
-   * Check if the KV Node circuit breaker is currently open (i.e., recent
-   * failures have disabled KV Node calls temporarily). Returns true if
-   * calls should be SKIPPED to avoid blocking the caller.
+   * Returns true when the caller should skip the KV Node entirely.
+   * In "half-open" state we let a single probe through (returns false) but
+   * subsequent concurrent calls still skip until the probe resolves.
    */
   _kvNodeCircuitOpen() {
-    return Date.now() < this._kvNodeDisabledUntil;
+    if (this._kvNodeState === "closed") return false;
+    if (this._kvNodeState === "open") {
+      if (Date.now() >= this._kvNodeDisabledUntil) {
+        // Cooldown expired — promote to half-open so the NEXT call can probe
+        this._kvNodeState = "half-open";
+        console.log(`[KV Node] Circuit HALF-OPEN — next call will probe the KV Node`);
+        return false;
+      }
+      return true;
+    }
+    // half-open — let one through; concurrent callers still skip
+    return false;
   }
 
   /**
-   * Record a KV Node failure. If threshold reached, open the circuit
-   * breaker to skip calls for a cooldown window.
+   * Record a KV Node failure. Threshold + escalating cooldown.
    */
   _kvNodeRecordFailure(reason) {
+    this._kvNodeLastError = reason;
     this._kvNodeFailures += 1;
-    if (this._kvNodeFailures >= this._KV_NODE_FAILURE_THRESHOLD && !this._kvNodeCircuitOpen()) {
-      this._kvNodeDisabledUntil = Date.now() + this._KV_NODE_DISABLE_WINDOW_MS;
+
+    // If we were probing (half-open) and failed, jump straight back to open
+    const shouldOpen =
+      this._kvNodeState === "half-open" ||
+      (this._kvNodeState === "closed" && this._kvNodeFailures >= this._KV_NODE_FAILURE_THRESHOLD);
+
+    if (shouldOpen) {
+      this._kvNodeState = "open";
+      this._kvNodeOpenCount += 1;
+      // Exponential backoff capped: 5m → 10m → 20m → 30m (max)
+      this._kvNodeCooldownMs = Math.min(
+        this._KV_NODE_BASE_COOLDOWN_MS * Math.pow(2, this._kvNodeOpenCount - 1),
+        this._KV_NODE_MAX_COOLDOWN_MS
+      );
+      this._kvNodeDisabledUntil = Date.now() + this._kvNodeCooldownMs;
       console.warn(
-        `[KV Node] Circuit OPENED after ${this._kvNodeFailures} failures (reason: ${reason}) — ` +
-        `skipping KV Node calls for ${this._KV_NODE_DISABLE_WINDOW_MS / 1000}s. ` +
-        `Runtime continues with in-memory + log-layer fallback only.`
+        `[KV Node] Circuit OPEN (cycle ${this._kvNodeOpenCount}, reason: ${reason}) — ` +
+        `cooldown ${(this._kvNodeCooldownMs / 1000).toFixed(0)}s. ` +
+        `Runtime continues with in-memory + Supabase fallback.`
       );
     }
   }
 
   /**
-   * Record a KV Node success — reset failure count.
+   * Record a KV Node success — close the circuit, reset counters.
    */
   _kvNodeRecordSuccess() {
-    if (this._kvNodeFailures > 0) {
-      console.log(`[KV Node] Circuit CLOSED — KV Node is reachable again`);
+    if (this._kvNodeState !== "closed") {
+      console.log(`[KV Node] Circuit CLOSED — KV Node is healthy again`);
     }
-    this._kvNodeFailures = 0;
+    this._kvNodeState         = "closed";
+    this._kvNodeFailures      = 0;
     this._kvNodeDisabledUntil = 0;
+    this._kvNodeOpenCount     = 0;
+    this._kvNodeCooldownMs    = this._KV_NODE_BASE_COOLDOWN_MS;
+    this._kvNodeLastError     = null;
+    this._kvNodeLastSuccessAt = Date.now();
+  }
+
+  /**
+   * Public health snapshot — used by the runtime /health endpoint.
+   */
+  getKvHealth() {
+    const now = Date.now();
+    return {
+      state:           this._kvNodeState,
+      failures:        this._kvNodeFailures,
+      openCount:       this._kvNodeOpenCount,
+      cooldownMs:      this._kvNodeCooldownMs,
+      reopensInMs:     this._kvNodeState === "open" ? Math.max(0, this._kvNodeDisabledUntil - now) : 0,
+      lastError:       this._kvNodeLastError,
+      lastSuccessAgoMs: this._kvNodeLastSuccessAt ? now - this._kvNodeLastSuccessAt : null,
+    };
+  }
+
+  /**
+   * Run an async fn against KV Node with bounded retries + exponential backoff.
+   * Used by both kvNodeRead and kvNodeWrite to absorb transient blips before
+   * counting against the circuit breaker.
+   */
+  async _withRetry(fn, label) {
+    const attempts = this._KV_NODE_RETRY_DELAYS_MS.length + 1;
+    let lastErr;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        return await fn();
+      } catch (err) {
+        lastErr = err;
+        if (i < this._KV_NODE_RETRY_DELAYS_MS.length) {
+          const delay = this._KV_NODE_RETRY_DELAYS_MS[i];
+          console.log(`[KV Node] ${label} attempt ${i + 1}/${attempts} failed (${err.message}) — retrying in ${delay}ms`);
+          await new Promise(r => setTimeout(r, delay));
+        }
+      }
+    }
+    throw lastErr;
   }
 
   /**
@@ -204,33 +281,32 @@ export class StorageService {
    * @returns {Promise<boolean>} true if persisted, false on any failure
    */
   async _kvNodeWrite(streamIdString, keyString, valueString) {
-    // Circuit breaker check — skip entirely if KV Node is known to be down
     if (this._kvNodeCircuitOpen()) return false;
 
     try {
       await this._withTimeout(this._initKvNode(), this._KV_NODE_CALL_TIMEOUT_MS, "KV init");
       if (!this._kvBatcher) return false;
 
-      const streamId = this._toStreamId(streamIdString);
-      const keyBytes = new Uint8Array(Buffer.from(keyString, "utf-8"));
+      const streamId   = this._toStreamId(streamIdString);
+      const keyBytes   = new Uint8Array(Buffer.from(keyString, "utf-8"));
       const valueBytes = new Uint8Array(Buffer.from(valueString, "utf-8"));
 
-      this._kvBatcher.streamDataBuilder.set(streamId, keyBytes, valueBytes);
-      const [tx, err] = await this._withTimeout(
-        this._kvBatcher.exec(),
-        this._KV_NODE_CALL_TIMEOUT_MS,
-        `KV write ${keyString}`
-      );
-      if (err) {
-        console.warn(`[KV Node] Write failed for ${streamIdString}/${keyString}: ${err.message || err}`);
-        this._kvNodeRecordFailure(err.message || String(err));
-        return false;
-      }
+      const tx = await this._withRetry(async () => {
+        this._kvBatcher.streamDataBuilder.set(streamId, keyBytes, valueBytes);
+        const [resTx, err] = await this._withTimeout(
+          this._kvBatcher.exec(),
+          this._KV_NODE_CALL_TIMEOUT_MS,
+          `KV write ${keyString}`
+        );
+        if (err) throw new Error(err.message || String(err));
+        return resTx;
+      }, `write ${streamIdString}/${keyString}`);
+
       this._kvNodeRecordSuccess();
       console.log(`[KV Node] Wrote ${streamIdString}/${keyString} (tx=${tx?.txHash?.slice(0, 10) || "?"}...)`);
       return true;
     } catch (err) {
-      console.warn(`[KV Node] Write exception for ${streamIdString}/${keyString}: ${err.message}`);
+      console.warn(`[KV Node] Write failed for ${streamIdString}/${keyString} after retries: ${err.message}`);
       this._kvNodeRecordFailure(err.message);
       return false;
     }
@@ -246,7 +322,6 @@ export class StorageService {
    * @returns {Promise<string|null>} The stored string value, or null
    */
   async _kvNodeRead(streamIdString, keyString) {
-    // Circuit breaker check — skip entirely if KV Node is known to be down
     if (this._kvNodeCircuitOpen()) return null;
 
     try {
@@ -256,29 +331,30 @@ export class StorageService {
       const streamId = this._toStreamId(streamIdString);
       const keyBytes = new Uint8Array(Buffer.from(keyString, "utf-8"));
       // KV Node RPC requires the key as a base64-encoded string
-      // (Uint8Array serializes to {0:..,1:..} which the server rejects with
-      // "invalid type: map, expected a string"). See 0G docs example:
-      //   kvClient.getValue(streamId, ethers.encodeBase64(keyBytes))
+      // (Uint8Array serializes to {0:..,1:..} which the server rejects).
       const keyB64 = encodeBase64(keyBytes);
 
-      const value = await this._withTimeout(
-        this._kvClient.getValue(streamId, keyB64),
-        this._KV_NODE_CALL_TIMEOUT_MS,
-        `KV read ${keyString}`
+      const value = await this._withRetry(
+        () => this._withTimeout(
+          this._kvClient.getValue(streamId, keyB64),
+          this._KV_NODE_CALL_TIMEOUT_MS,
+          `KV read ${keyString}`
+        ),
+        `read ${streamIdString}/${keyString}`
       );
+
       if (!value || !value.data) {
         this._kvNodeRecordSuccess(); // reached the node, just no data
         return null;
       }
 
-      // value.data is Bytes — convert back to string
       const bytes = typeof value.data === "string"
         ? Buffer.from(value.data.replace(/^0x/, ""), "hex")
         : Buffer.from(value.data);
       this._kvNodeRecordSuccess();
       return bytes.toString("utf-8");
     } catch (err) {
-      console.warn(`[KV Node] Read exception for ${streamIdString}/${keyString}: ${err.message}`);
+      console.warn(`[KV Node] Read failed for ${streamIdString}/${keyString} after retries: ${err.message}`);
       this._kvNodeRecordFailure(err.message);
       return null;
     }
