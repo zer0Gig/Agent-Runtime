@@ -525,10 +525,24 @@ export class PlatformDispatcher {
         return;
       }
 
+      // Fetch the subscription's task description so the bot knows its mission
+      const subEscrowForBot = new ethers.Contract(
+        this.subscriptionEscrowAddress, SUBSCRIPTION_ESCROW_ABI, this.provider
+      );
+      const taskHashForBot = await subEscrowForBot.subscriptionTaskHash(subscriptionId).catch(() => null);
+      const taskRowForBot  = taskHashForBot ? await fetchSubscriptionTaskByHash(taskHashForBot) : null;
+      const taskDescription = taskRowForBot?.task_description || null;
+
       const agentConfig = this.agentConfigs.get(agentIdStr) || {};
+      const basePrompt  = agentConfig.platformConfig?.systemPrompt ||
+        "You are an autonomous AI agent on Telegram powered by zer0Gig.";
+      const subscriptionSystemPrompt = taskDescription
+        ? `${basePrompt}\n\nYour mission for this subscription:\n${taskDescription}\n\nWhen users ask about your work, status, or latest findings, answer based on your task and what you've observed so far. Be concise and factual.`
+        : basePrompt;
+
       const extendedCompute = new ExtendedComputeService(this.wallet, {
         provider: agentConfig.platformConfig?.llmProvider || "0g-compute",
-        systemPrompt: agentConfig.platformConfig?.systemPrompt || "You are a helpful customer service assistant.",
+        systemPrompt: subscriptionSystemPrompt,
       });
 
       const memoryService = new MemoryService(agentIdStr, extendedCompute, this.storage);
@@ -539,12 +553,11 @@ export class PlatformDispatcher {
         extendedCompute,
         memoryService,
         storageService: this.storage,
-        // Pass the agent's actual tools and skills so the CS Bot behaves like the real agent
         agentId:        agentIdStr,
         customTools:    agentConfig.tools           || [],
         prebuiltSkills: agentConfig.prebuiltSkills  || [],
         skillConfigs:   agentConfig.skillConfigs    || {},
-        systemPrompt:   agentConfig.platformConfig?.systemPrompt || null,
+        systemPrompt:   subscriptionSystemPrompt,
       });
 
       await bot.start();
@@ -784,6 +797,21 @@ export class PlatformDispatcher {
         anomalyDetected: observation.anomalyDetected,
         timestamp: Date.now(),
       });
+    }
+
+    // ── Proactive Telegram report to client ────────────────────────────────
+    const csBot = this.customerServiceBots.get(`sub-${subIdStr}`);
+    if (csBot) {
+      const emoji = observation.anomalyDetected ? "🚨" : "✅";
+      const actionLine = onChainAction?.ok
+        ? (onChainAction.kind === "alert"
+            ? `\n\n⛓ Alert filed on-chain.`
+            : `\n\n⛓ Check-in confirmed on-chain.`)
+        : "";
+      const reportText =
+        `${emoji} <b>Agent Report — Sub #${subIdStr}</b>\n\n` +
+        `${observation.observation}${actionLine}`;
+      csBot.sendReport(reportText).catch(() => {});
     }
 
     return {

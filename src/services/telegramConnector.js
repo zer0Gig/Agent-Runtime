@@ -462,6 +462,8 @@ export class CustomerServiceBot {
     this.systemPrompt   = config.systemPrompt   || null;
     // In-session conversation history per chatId (last 10 exchanges)
     this._history       = new Map(); // chatId → string[]
+    // Track every chat that has messaged this bot (seed from allowedChats)
+    this._knownChats    = new Set(config.allowedChats || []);
   }
 
   async start() {
@@ -479,6 +481,7 @@ export class CustomerServiceBot {
         return;
       }
 
+      this._knownChats.add(chatId); // remember for proactive reports
       console.log(`[CS Bot] Message from ${chatId}: "${message.slice(0, 50)}..."`);
       this._logMessage(chatId, "user", message); // fire-and-forget — don't block handler
 
@@ -534,6 +537,18 @@ export class CustomerServiceBot {
       this.bot.stop("SIGTERM");
       this.bot = null;
       console.log("[CS Bot] Stopped.");
+    }
+  }
+
+  /** Proactively push a report to every chat that has interacted with this bot. */
+  async sendReport(text) {
+    if (!this.bot || this._knownChats.size === 0) return;
+    for (const chatId of this._knownChats) {
+      try {
+        await this.bot.telegram.sendMessage(chatId, text, { parse_mode: "HTML" });
+      } catch (err) {
+        console.warn(`[CS Bot] sendReport to ${chatId} failed: ${err.message}`);
+      }
     }
   }
 
