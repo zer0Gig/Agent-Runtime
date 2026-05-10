@@ -56,6 +56,49 @@ async function resolveSkills(agentId, prebuiltSkillIds = []) {
   }
 }
 
+/**
+ * Persist a skill config update back to Supabase agent_skills table.
+ * Called after credential collection to save credentials for future runs.
+ */
+export async function updateAgentSkillConfig(agentId, skillId, configPatch) {
+  if (!agentId || !skillId || !SUPABASE_URL || !SUPABASE_KEY) return false;
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/agent_skills?agent_id=eq.${agentId}&skill_id=eq.${skillId}`,
+      {
+        method: "PATCH",
+        headers: {
+          apikey: SUPABASE_KEY,
+          Authorization: `Bearer ${SUPABASE_KEY}`,
+          "Content-Type": "application/json",
+          Prefer: "return=minimal",
+        },
+        body: JSON.stringify({ config: configPatch }),
+        signal: AbortSignal.timeout(5000),
+      }
+    );
+    if (!res.ok) {
+      // Row doesn't exist yet — insert it
+      const ins = await fetch(`${SUPABASE_URL}/rest/v1/agent_skills`, {
+        method: "POST",
+        headers: {
+          apikey: SUPABASE_KEY,
+          Authorization: `Bearer ${SUPABASE_KEY}`,
+          "Content-Type": "application/json",
+          Prefer: "return=minimal",
+        },
+        body: JSON.stringify({ agent_id: agentId, skill_id: skillId, config: configPatch, is_active: true }),
+        signal: AbortSignal.timeout(5000),
+      });
+      return ins.ok;
+    }
+    return true;
+  } catch (err) {
+    console.warn(`[ToolExecutor] updateAgentSkillConfig error: ${err.message}`);
+    return false;
+  }
+}
+
 // ─── BUILTIN SKILL HANDLERS ─────────────────────────────────────────────────
 
 /**
@@ -704,8 +747,98 @@ async function builtinN8nManager(skill, jobBrief) {
     return res.json();
   }
 
+  // ── LIST workflows ───────────────────────────────────────────────────────
+  async function listWorkflows() {
+    const res = await fetch(`${n8nUrl}/api/v1/workflows?limit=50`, { headers, signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) return { error: `List failed: HTTP ${res.status}` };
+    const data = await res.json();
+    return { workflows: (data.data || []).map(w => ({ id: w.id, name: w.name, active: w.active, updatedAt: w.updatedAt })) };
+  }
+
+  // ── UPDATE workflow ──────────────────────────────────────────────────────
+  async function updateWorkflow(workflowId, patchJson) {
+    const res = await fetch(`${n8nUrl}/api/v1/workflows/${workflowId}`, {
+      method: "PUT", headers,
+      body: JSON.stringify(patchJson),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) { const err = await res.text().catch(() => ""); return { error: `Update failed: HTTP ${res.status} — ${err.slice(0,200)}` }; }
+    const data = await res.json();
+    return { workflowId: data.id, name: data.name, active: data.active };
+  }
+
+  // ── DELETE workflow ──────────────────────────────────────────────────────
+  async function deleteWorkflow(workflowId) {
+    const res = await fetch(`${n8nUrl}/api/v1/workflows/${workflowId}`, { method: "DELETE", headers, signal: AbortSignal.timeout(10_000) });
+    return res.ok ? { deleted: workflowId } : { error: `Delete failed: HTTP ${res.status}` };
+  }
+
+  // ── GET EXECUTIONS for workflow ──────────────────────────────────────────
+  async function getWorkflowExecutions(workflowId) {
+    const res = await fetch(`${n8nUrl}/api/v1/executions?workflowId=${workflowId}&limit=10`, { headers, signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) return { error: `Executions fetch failed: HTTP ${res.status}` };
+    const data = await res.json();
+    return { executions: (data.data || []).map(e => ({ id: e.id, status: e.status, startedAt: e.startedAt, stoppedAt: e.stoppedAt })) };
+  }
+
+  // ── CREATE CREDENTIAL in n8n ─────────────────────────────────────────────
+  async function createCredential(type, name, credData) {
+    const res = await fetch(`${n8nUrl}/api/v1/credentials`, {
+      method: "POST", headers,
+      body: JSON.stringify({ type, name, data: credData }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) { const err = await res.text().catch(() => ""); return { error: `Create credential failed: HTTP ${res.status} — ${err.slice(0,200)}` }; }
+    const data = await res.json();
+    console.log(`[ToolExecutor:n8n] Created credential id=${data.id} type="${type}"`);
+    return { credentialId: data.id, name: data.name, type: data.type };
+  }
+
   // ── DISPATCH ─────────────────────────────────────────────────────────────
   try {
+    if (action === "list") {
+      const result = await listWorkflows();
+      if (result.error) return `[n8n_manager] ${result.error}`;
+      const wfList = result.workflows.map(w => `  • [${w.id}] ${w.name} (active: ${w.active})`).join("\n");
+      return `[n8n_manager] ${result.workflows.length} workflow(s) in your n8n instance:\n${wfList}`;
+    }
+
+    if (action === "update") {
+      const wfId = n8nMeta.workflowId || skill.config?.workflowId;
+      const patchJson = n8nMeta.workflowJson;
+      if (!wfId || !patchJson) return `[n8n_manager] action="update" requires workflowId and workflowJson`;
+      const result = await updateWorkflow(wfId, patchJson);
+      if (result.error) return `[n8n_manager] ${result.error}`;
+      const { createHash } = await import("crypto");
+      const newHash = createHash("sha256").update(JSON.stringify(patchJson)).digest("hex");
+      return `[n8n_manager] Workflow updated.\n  ID: ${result.workflowId}\n  Name: ${result.name}\n  Hash: ${newHash}`;
+    }
+
+    if (action === "delete") {
+      const wfId = n8nMeta.workflowId || skill.config?.workflowId;
+      if (!wfId) return `[n8n_manager] action="delete" requires workflowId`;
+      const result = await deleteWorkflow(wfId);
+      if (result.error) return `[n8n_manager] ${result.error}`;
+      return `[n8n_manager] Workflow ${wfId} deleted.`;
+    }
+
+    if (action === "get_executions") {
+      const wfId = n8nMeta.workflowId || skill.config?.workflowId;
+      if (!wfId) return `[n8n_manager] action="get_executions" requires workflowId`;
+      const result = await getWorkflowExecutions(wfId);
+      if (result.error) return `[n8n_manager] ${result.error}`;
+      const execList = result.executions.map(e => `  • [${e.id}] ${e.status} — started ${e.startedAt}`).join("\n");
+      return `[n8n_manager] ${result.executions.length} execution(s) for workflow ${wfId}:\n${execList}`;
+    }
+
+    if (action === "create_credential") {
+      const { credType, credName, credData } = n8nMeta;
+      if (!credType || !credData) return `[n8n_manager] action="create_credential" requires credType and credData in metadata.n8n`;
+      const result = await createCredential(credType, credName || credType, credData);
+      if (result.error) return `[n8n_manager] ${result.error}`;
+      return `[n8n_manager] Credential registered in n8n.\n  ID: ${result.credentialId}\n  Type: ${result.type}\n  Name: ${result.name}`;
+    }
+
     if (action === "create" || action === "create_and_execute") {
       const workflowJson = n8nMeta.workflowJson;
       if (!workflowJson) {
@@ -756,7 +889,7 @@ async function builtinN8nManager(skill, jobBrief) {
       return `[n8n_manager] Execution triggered.\n  Execution ID: ${exec.executionId}\n  Status: ${exec.status}`;
     }
 
-    return `[n8n_manager] Unknown action: "${action}". Use: create | execute | create_and_execute`;
+    return `[n8n_manager] Unknown action: "${action}". Supported: create | execute | create_and_execute | list | update | delete | get_executions | create_credential`;
   } catch (err) {
     return `[n8n_manager] Error: ${err.message}`;
   }
@@ -774,7 +907,7 @@ async function builtinN8nManager(skill, jobBrief) {
  * n8n workflow should respond with JSON. Special keys surfaced as file outputs:
  *   fileUrl | outputUrl | mp3Url | mp4Url | pdfUrl | audioUrl | videoUrl
  */
-async function builtinN8nWebhook(skill, jobBrief) {
+async function builtinN8nWebhook(skill, jobBrief, _storageService = null) {
   const webhookUrl = skill.config?.webhookUrl;
   const apiKey = decryptApiKey(skill.config?.apiKey);
 
@@ -827,6 +960,26 @@ async function builtinN8nWebhook(skill, jobBrief) {
   let summary = `[n8n_webhook] Workflow completed.\n`;
   if (files.length) summary += `\nOutput files:\n${files.join("\n")}\n`;
   summary += `\nResponse:\n${JSON.stringify(data, null, 2).slice(0, 2000)}`;
+
+  // Auto-upload any file URLs to 0G Storage if storageService provided
+  if (_storageService && files.length) {
+    const uploaded = [];
+    for (const key of FILE_KEYS.filter(k => data[k])) {
+      try {
+        const fileRes = await fetch(data[key], { signal: AbortSignal.timeout(60_000) });
+        if (!fileRes.ok) continue;
+        const buf = Buffer.from(await fileRes.arrayBuffer());
+        const ext = data[key].split(".").pop()?.split("?")[0] || "bin";
+        const cid = await _storageService.uploadBinaryFile(buf, `n8n-output-${Date.now()}.${ext}`);
+        uploaded.push(`  ${key} → 0G CID: ${cid}`);
+        data[`${key}_cid`] = cid;
+      } catch (upErr) {
+        console.warn(`[ToolExecutor:n8n] File upload failed for ${key}: ${upErr.message}`);
+      }
+    }
+    if (uploaded.length) summary += `\n0G Storage uploads:\n${uploaded.join("\n")}\n`;
+  }
+
   return summary;
 }
 
@@ -888,7 +1041,7 @@ async function builtinEmailSend(skill, jobBrief) {
 }
 
 /** Dispatch to the correct builtin handler. */
-async function executeBuiltinSkill(skill, jobBrief) {
+async function executeBuiltinSkill(skill, jobBrief, storageService = null) {
   const id = skill.id || skill.skill_id || "";
   console.log(`[ToolExecutor] Executing builtin skill: ${id}`);
   switch (id) {
@@ -902,7 +1055,7 @@ async function executeBuiltinSkill(skill, jobBrief) {
     case "chart_patterns":    return builtinChartPatterns(skill, jobBrief);
     case "risk_management":   return builtinRiskManagement(skill, jobBrief);
     case "email_send":        return builtinEmailSend(skill, jobBrief);
-    case "n8n_webhook":       return builtinN8nWebhook(skill, jobBrief);
+    case "n8n_webhook":       return builtinN8nWebhook(skill, jobBrief, storageService);
     case "n8n_manager":       return builtinN8nManager(skill, jobBrief);
     default:
       console.warn(`[ToolExecutor] No handler for builtin skill: ${id}`);
@@ -920,7 +1073,7 @@ async function executeBuiltinSkill(skill, jobBrief) {
  * @param {number} agentId  - Agent ID for Supabase skill config lookup.
  * @returns {string} Aggregated context string from all tools + skills.
  */
-export async function executeForJob(jobBrief, tools = [], prebuiltSkillIds = [], agentId = null) {
+export async function executeForJob(jobBrief, tools = [], prebuiltSkillIds = [], agentId = null, storageService = null) {
   const results = [];
 
   // ── Custom tools (HTTP / MCP) ──────────────────────────────────────────
@@ -950,7 +1103,7 @@ export async function executeForJob(jobBrief, tools = [], prebuiltSkillIds = [],
         // DB column is `tool_name`, not `tool_type`
         const toolType = skill.tool_name || skill.tool_type || "builtin";
         if (toolType === "builtin") {
-          result = await executeBuiltinSkill(skill, jobBrief);
+          result = await executeBuiltinSkill(skill, jobBrief, storageService);
         } else if (toolType === "http") {
           result = await executeHttpTool(
             { name: skill.name, config: { endpoint: skill.endpoint_url || skill.config?.endpoint, method: "POST", ...skill.config } },

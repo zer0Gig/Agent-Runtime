@@ -8,7 +8,7 @@
 
 import { JobProcessor, logActivity, sendChatMessage } from "./jobProcessor.js";
 import { ExtendedComputeService } from "./extendedComputeService.js";
-import { executeForJob } from "./toolExecutor.js";
+import { executeForJob, updateAgentSkillConfig } from "./toolExecutor.js";
 import { sendMilestoneCard, sendNotification, sendJobCompletionAlert, CustomerServiceBot } from "./telegramConnector.js";
 import { SelfEvaluator } from "./selfEvaluator.js";
 import { MemoryService } from "./memoryService.js";
@@ -341,6 +341,108 @@ export class PlatformJobProcessor extends JobProcessor {
   }
 
   /**
+   * Poll job chat for credentials after posting a CREDENTIAL_REQUEST message.
+   * Looks for URL and API_KEY patterns in user replies (10 min window).
+   * Returns { n8nUrl?, apiKey?, webhookUrl? } or null if timeout.
+   */
+  async _collectCredentials(jobId, skillType, instructions) {
+    const TIMEOUT = 10 * 60 * 1000;
+    const POLL_INTERVAL = 2_000;
+    const deadline = Date.now() + TIMEOUT;
+    let lastMsgTime = new Date().toISOString();
+
+    await postChat(
+      jobId,
+      `⚙️ To complete this task I need access to your n8n instance.\n\n${instructions}\n\n` +
+      `Please reply with your credentials in this format:\n` +
+      (skillType === "n8n_manager"
+        ? `URL: https://your-n8n.app.n8n.cloud\nAPI_KEY: your-api-key`
+        : `WEBHOOK_URL: https://your-n8n.com/webhook/abc-123`),
+      "credential_request",
+      { skillType }
+    );
+
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, POLL_INTERVAL));
+      try {
+        const res = await fetch(`${ACTIVITY_BASE}/api/job-chat?jobId=${jobId}&since=${encodeURIComponent(lastMsgTime)}`);
+        if (!res.ok) continue;
+        const msgs = (await res.json()).filter(m => m.sender === "user");
+        if (!msgs.length) continue;
+        lastMsgTime = new Date().toISOString();
+        const text = msgs.map(m => m.message).join("\n");
+
+        // Parse URL: ... and API_KEY: ... patterns
+        const urlMatch       = text.match(/URL:\s*(https?:\/\/\S+)/i);
+        const apiKeyMatch    = text.match(/API_KEY:\s*(\S+)/i);
+        const webhookMatch   = text.match(/WEBHOOK_URL:\s*(https?:\/\/\S+)/i);
+
+        if (urlMatch || webhookMatch || apiKeyMatch) {
+          const creds = {};
+          if (urlMatch)     creds.n8nUrl     = urlMatch[1].trim();
+          if (apiKeyMatch)  creds.apiKey     = apiKeyMatch[1].trim();
+          if (webhookMatch) creds.webhookUrl = webhookMatch[1].trim();
+          await postChat(jobId, `✅ Credentials received — connecting to n8n now...`);
+          return creds;
+        }
+        // If user replied but format was wrong
+        await postChat(jobId, `I couldn't parse the credentials. Please use the format above — copy-paste is easiest!`);
+      } catch { /* ignore */ }
+    }
+    await postChat(jobId, `⏱️ Credential request timed out (10 min). Continuing without n8n integration.`);
+    return null;
+  }
+
+  /**
+   * Use LLM to design an n8n workflow JSON for the given job.
+   * Returns a parsed n8n workflow object, or null if generation fails.
+   */
+  async _designN8nWorkflow(jobBrief) {
+    const taskText = typeof jobBrief === "string" ? jobBrief
+      : `${jobBrief.title || ""} — ${jobBrief.description || JSON.stringify(jobBrief)}`;
+
+    const prompt = `You are an expert n8n workflow designer. Design a valid n8n workflow JSON for this task:
+
+TASK: ${taskText.slice(0, 800)}
+
+Return ONLY a valid n8n workflow JSON object (no markdown, no explanation). The workflow must have:
+- "name": descriptive workflow name
+- "nodes": array of n8n nodes
+- "connections": node connections object
+- "settings": {}
+
+Use appropriate n8n nodes (HTTP Request, Gmail, Google Sheets, Code, etc.) to automate the task.
+Common node types: "n8n-nodes-base.webhook", "n8n-nodes-base.httpRequest", "n8n-nodes-base.gmail", "n8n-nodes-base.code", "n8n-nodes-base.set"`;
+
+    try {
+      const result = await this.extendedCompute.processTask(prompt, "", "");
+      const raw = result.content.trim();
+      // Extract JSON from response (handle markdown code blocks)
+      const jsonMatch = raw.match(/```(?:json)?\s*([\s\S]+?)```/) || [null, raw];
+      return JSON.parse(jsonMatch[1].trim());
+    } catch (err) {
+      console.warn(`[PlatformProcessor] n8n workflow design failed: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Override base _buildTaskPrompt to inject n8n capability context when applicable.
+   */
+  _buildTaskPrompt(brief, milestoneIndex, totalMilestones) {
+    const base = super._buildTaskPrompt(brief, milestoneIndex, totalMilestones);
+    const hasN8n = (this.agentConfig.prebuiltSkills || []).some(s => s.startsWith("n8n_"));
+    if (!hasN8n) return base;
+
+    return base + `
+
+N8N AUTOMATION CONTEXT:
+You have access to n8n workflow automation. If this task requires external API integrations (YouTube, Gmail, Slack, Google Sheets, TikTok, etc.), the n8n_manager skill has already been invoked to design and execute the required workflow autonomously.
+
+Incorporate any n8n workflow outputs from the tool context into your deliverable. Reference workflow IDs or execution results if available.`;
+  }
+
+  /**
    * Override processMilestone to inject tool context and use ExtendedComputeService.
    * @param {bigint} jobId 
    * @param {number} milestoneIndex 
@@ -370,10 +472,48 @@ export class PlatformJobProcessor extends JobProcessor {
     let toolContext = "";
     if (customTools.length > 0 || prebuiltSkills.length > 0) {
       console.log(`[PlatformProcessor] Executing ${customTools.length} tool(s) + ${prebuiltSkills.length} skill(s)...`);
+
+      // Auto-design n8n workflow if n8n_manager skill is present and brief has no workflow JSON yet
+      const hasN8nManager = prebuiltSkills.includes("n8n_manager");
+      if (hasN8nManager && !jobBrief?.metadata?.n8n?.workflowJson) {
+        console.log(`[PlatformProcessor] n8n_manager detected — designing workflow autonomously...`);
+        await logActivity({ jobId: id, agentId, agentWallet, phase: "n8n_design",
+          message: "Designing n8n workflow autonomously...", milestoneIndex });
+        const workflowJson = await this._designN8nWorkflow(jobBrief);
+        if (workflowJson) {
+          jobBrief = { ...(typeof jobBrief === "object" ? jobBrief : { task: jobBrief }),
+            metadata: { ...(jobBrief?.metadata || {}), n8n: { action: "create_and_execute", workflowJson } } };
+          console.log(`[PlatformProcessor] Workflow designed: "${workflowJson.name}"`);
+          await logActivity({ jobId: id, agentId, agentWallet, phase: "n8n_design",
+            message: `Workflow designed: "${workflowJson.name}" — deploying to n8n...`, milestoneIndex });
+        }
+      }
+
       try {
-        toolContext = await executeForJob(jobBrief, customTools, prebuiltSkills, agentId);
+        toolContext = await executeForJob(jobBrief, customTools, prebuiltSkills, agentId, this.storage);
         if (toolContext) {
           console.log("[PlatformProcessor] Tool/skill context generated.");
+        }
+
+        // Detect CREDENTIAL_REQUEST — collect creds then re-run
+        const credReqMatch = toolContext?.match(/\[(n8n_\w+)\] CREDENTIAL_REQUEST\n([\s\S]+?)(?=\n\n\[|$)/);
+        if (credReqMatch) {
+          const skillType = credReqMatch[1];
+          const instructions = credReqMatch[2].trim();
+          console.log(`[PlatformProcessor] CREDENTIAL_REQUEST detected for ${skillType}`);
+          await logActivity({ jobId: id, agentId, agentWallet, phase: "credential_request",
+            message: `Requesting ${skillType} credentials from user...`, milestoneIndex });
+
+          const creds = await this._collectCredentials(id, skillType, instructions);
+          if (creds) {
+            // Persist to Supabase and re-run with fresh config
+            await updateAgentSkillConfig(agentId, skillType, creds);
+            await logActivity({ jobId: id, agentId, agentWallet, phase: "credential_saved",
+              message: `${skillType} credentials saved — re-running with n8n integration...`, milestoneIndex });
+            toolContext = await executeForJob(jobBrief, customTools, prebuiltSkills, agentId, this.storage);
+          } else {
+            toolContext = toolContext.replace(credReqMatch[0], `[${skillType}] Credentials not provided by user — skipping.`);
+          }
         }
       } catch (error) {
         console.error("[PlatformProcessor] Tool execution failed:", error.message);
