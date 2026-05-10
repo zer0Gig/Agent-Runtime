@@ -559,12 +559,45 @@ export class CustomerServiceBot {
     this._history.set(chatId, hist);
   }
 
+  /**
+   * Re-fetch agent tools from Supabase on every reply so newly added
+   * MCP/HTTP tools become available immediately without restarting the runtime.
+   */
+  async _refreshToolsFromSupabase() {
+    if (!this.agentId) return;
+    const sbUrl = process.env.SUPABASE_URL;
+    const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+    if (!sbUrl || !sbKey) return;
+    try {
+      const res = await fetch(
+        `${sbUrl}/rest/v1/agent_profiles?agent_id=eq.${this.agentId}&select=metadata`,
+        { headers: { apikey: sbKey, Authorization: `Bearer ${sbKey}` } }
+      );
+      if (!res.ok) return;
+      const rows = await res.json();
+      const tools = rows?.[0]?.metadata?.tools;
+      if (Array.isArray(tools)) {
+        const before = this.customTools.length;
+        this.customTools = tools;
+        if (tools.length !== before) {
+          console.log(`[CS Bot] Refreshed tools from Supabase: ${before} → ${tools.length}`);
+        }
+      }
+    } catch (err) {
+      console.warn(`[CS Bot] Tool refresh failed: ${err.message}`);
+    }
+  }
+
   async _generateReply(chatId, message) {
     // ── 0G-compatible agentic pattern with persistent memory ─────────────
     // Memory layers:
     //   1. In-session _history Map (recent exchanges, ~10 turns)
     //   2. 0G Storage via memoryService (cross-restart persistent learnings)
     // Tool execution: pre-execute then inject as context (0G Compute compat)
+
+    // Phase 0: Refresh tools from Supabase (so newly-added MCP/HTTP tools work
+    //          without restarting the runtime)
+    await this._refreshToolsFromSupabase();
 
     // Phase 1: Load persistent memory from 0G Storage
     let persistentMemory = null;

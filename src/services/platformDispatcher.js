@@ -851,6 +851,26 @@ export class PlatformDispatcher {
       }
     }
 
+    // ── Refresh tools from Supabase before each tick ─────────────────────
+    // Owner may have added/removed MCP or HTTP tools via the edit UI; pick those
+    // up without requiring a runtime restart.
+    if (config.agentId) {
+      try {
+        const fresh = await fetchManifestFromSupabase(config.agentId);
+        if (fresh && Array.isArray(fresh.tools)) {
+          if (fresh.tools.length !== (config.tools || []).length) {
+            console.log(`[Sub #${subscriptionId}] Tool list refreshed: ${(config.tools || []).length} → ${fresh.tools.length}`);
+          }
+          config.tools = fresh.tools;
+        }
+        if (fresh && Array.isArray(fresh.prebuiltSkills)) {
+          config.prebuiltSkills = fresh.prebuiltSkills;
+        }
+      } catch (err) {
+        console.warn(`[Sub #${subscriptionId}] Tool refresh failed: ${err.message}`);
+      }
+    }
+
     // ── Execute the agent's full toolkit (custom tools + MCPs + pre-built skills) ──
     // Same arsenal that's available during job processing. The brief is built from the
     // task description so tools that depend on it (web_search, market_analysis,
