@@ -620,6 +620,149 @@ async function builtinRiskManagement(skill, jobBrief) {
 }
 
 /**
+ * n8n_manager — full n8n REST API management skill.
+ * Allows the agent to autonomously: design a workflow, create it in n8n,
+ * activate it, execute it, and retrieve the result.
+ *
+ * skill.config: { n8nUrl, apiKey, action?, workflowId? }
+ * jobBrief.metadata.n8n: {
+ *   action: "create" | "execute" | "create_and_execute",
+ *   workflowJson?: object,   -- n8n workflow definition (LLM-generated)
+ *   workflowId?: string,     -- for execute/status
+ * }
+ *
+ * If n8nUrl or apiKey missing → emits CREDENTIAL_REQUEST.
+ */
+async function builtinN8nManager(skill, jobBrief) {
+  const n8nUrl  = (skill.config?.n8nUrl || "").replace(/\/$/, "");
+  const apiKey  = decryptApiKey(skill.config?.apiKey);
+
+  if (!n8nUrl || !apiKey) {
+    return (
+      `[n8n_manager] CREDENTIAL_REQUEST\n` +
+      `This task requires access to your n8n instance but credentials are missing.\n\n` +
+      `Please ask the user to provide:\n` +
+      `  1. n8n instance URL  — e.g. https://your-n8n.app.n8n.cloud\n` +
+      `  2. n8n API key       — Settings → API → Create API key\n\n` +
+      `Once configured, the agent will autonomously design and execute workflows on your behalf.`
+    );
+  }
+
+  const n8nMeta = (typeof jobBrief === "object" ? jobBrief?.metadata?.n8n : null) || {};
+  const action  = n8nMeta.action || skill.config?.action || "create_and_execute";
+  const headers = { "Content-Type": "application/json", "X-N8N-API-KEY": apiKey };
+
+  // ── CREATE workflow ──────────────────────────────────────────────────────
+  async function createWorkflow(workflowJson) {
+    if (!workflowJson) return { error: "No workflow JSON provided" };
+    const res = await fetch(`${n8nUrl}/api/v1/workflows`, {
+      method: "POST", headers,
+      body: JSON.stringify(workflowJson),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) {
+      const err = await res.text().catch(() => "");
+      return { error: `Create failed: HTTP ${res.status} — ${err.slice(0, 200)}` };
+    }
+    const data = await res.json();
+    console.log(`[ToolExecutor:n8n] Created workflow id=${data.id} name="${data.name}"`);
+    return { workflowId: data.id, name: data.name };
+  }
+
+  // ── ACTIVATE workflow ────────────────────────────────────────────────────
+  async function activateWorkflow(workflowId) {
+    const res = await fetch(`${n8nUrl}/api/v1/workflows/${workflowId}`, {
+      method: "PATCH", headers,
+      body: JSON.stringify({ active: true }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    return res.ok;
+  }
+
+  // ── EXECUTE workflow ─────────────────────────────────────────────────────
+  async function executeWorkflow(workflowId) {
+    const res = await fetch(`${n8nUrl}/api/v1/workflows/${workflowId}/execute`, {
+      method: "POST", headers,
+      body: JSON.stringify({ workflowData: {} }),
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!res.ok) {
+      const err = await res.text().catch(() => "");
+      return { error: `Execute failed: HTTP ${res.status} — ${err.slice(0, 200)}` };
+    }
+    const data = await res.json();
+    return { executionId: data.executionId || data.id, status: data.status };
+  }
+
+  // ── GET execution result ─────────────────────────────────────────────────
+  async function getExecution(executionId) {
+    const res = await fetch(`${n8nUrl}/api/v1/executions/${executionId}`, {
+      headers,
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return { status: "unknown" };
+    return res.json();
+  }
+
+  // ── DISPATCH ─────────────────────────────────────────────────────────────
+  try {
+    if (action === "create" || action === "create_and_execute") {
+      const workflowJson = n8nMeta.workflowJson;
+      if (!workflowJson) {
+        return `[n8n_manager] action="${action}" requires jobBrief.metadata.n8n.workflowJson — the LLM should generate this as a valid n8n workflow JSON object.`;
+      }
+
+      const created = await createWorkflow(workflowJson);
+      if (created.error) return `[n8n_manager] ${created.error}`;
+
+      // Compute workflow hash for on-chain proof
+      const { createHash } = await import("crypto");
+      const workflowHash = createHash("sha256")
+        .update(JSON.stringify(workflowJson))
+        .digest("hex");
+
+      if (action === "create") {
+        return `[n8n_manager] Workflow created.\n  ID: ${created.workflowId}\n  Name: ${created.name}\n  Hash: ${workflowHash}`;
+      }
+
+      // create_and_execute
+      await activateWorkflow(created.workflowId);
+      const exec = await executeWorkflow(created.workflowId);
+      if (exec.error) return `[n8n_manager] Workflow created (id=${created.workflowId}) but execution failed: ${exec.error}`;
+
+      // Poll for completion (max 5 attempts × 4s)
+      let execResult = exec;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        await new Promise(r => setTimeout(r, 4000));
+        execResult = await getExecution(exec.executionId);
+        if (["success", "error", "crashed"].includes(execResult.status)) break;
+      }
+
+      return (
+        `[n8n_manager] Workflow designed and executed autonomously.\n` +
+        `  Workflow ID:   ${created.workflowId}\n` +
+        `  Workflow Hash: ${workflowHash}\n` +
+        `  Execution ID:  ${exec.executionId}\n` +
+        `  Status:        ${execResult.status || "running"}\n` +
+        `  Output:\n${JSON.stringify(execResult.data || {}, null, 2).slice(0, 1500)}`
+      );
+    }
+
+    if (action === "execute") {
+      const wfId = n8nMeta.workflowId || skill.config?.workflowId;
+      if (!wfId) return `[n8n_manager] action="execute" requires workflowId`;
+      const exec = await executeWorkflow(wfId);
+      if (exec.error) return `[n8n_manager] ${exec.error}`;
+      return `[n8n_manager] Execution triggered.\n  Execution ID: ${exec.executionId}\n  Status: ${exec.status}`;
+    }
+
+    return `[n8n_manager] Unknown action: "${action}". Use: create | execute | create_and_execute`;
+  } catch (err) {
+    return `[n8n_manager] Error: ${err.message}`;
+  }
+}
+
+/**
  * n8n_webhook — triggers an n8n workflow via webhook and returns its output.
  *
  * If webhookUrl is missing the skill emits a CREDENTIAL_REQUEST that the LLM
@@ -760,6 +903,7 @@ async function executeBuiltinSkill(skill, jobBrief) {
     case "risk_management":   return builtinRiskManagement(skill, jobBrief);
     case "email_send":        return builtinEmailSend(skill, jobBrief);
     case "n8n_webhook":       return builtinN8nWebhook(skill, jobBrief);
+    case "n8n_manager":       return builtinN8nManager(skill, jobBrief);
     default:
       console.warn(`[ToolExecutor] No handler for builtin skill: ${id}`);
       return `[${id}] Builtin handler not implemented yet.`;

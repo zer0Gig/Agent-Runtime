@@ -202,7 +202,7 @@ export class JobProcessor {
         await this.processMilestone(jobId, i, job, jobBrief);
       }
 
-      // After all milestones: commit full activity log bundle to 0G Storage (on-chain)
+      // After all milestones: commit full activity log bundle + record portfolio entry
       await this._uploadActivityBundleOnChain(jobId, job.agentId?.toString(), job.agentWallet);
 
       console.log(`[Processor] ========== JOB ${id} COMPLETE ==========\n`);
@@ -211,6 +211,79 @@ export class JobProcessor {
     } finally {
       this.processing.delete(id);
     }
+  }
+
+  /**
+   * Build and commit a proof bundle, then POST a portfolio entry to the frontend.
+   * Non-sensitive: summary derived from brief category, no client data exposed.
+   */
+  async _recordPortfolioEntry(jobId, job, jobBrief, computeResult, outputCID, txHash) {
+    const frontendUrl = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_APP_URL;
+    if (!frontendUrl) return;
+
+    // Upload proof bundle to 0G Storage — bundles compute attestation + output CID
+    const proofBundle = {
+      jobId: jobId.toString(),
+      agentId: job.agentId.toString(),
+      outputCID,
+      txHash,
+      computeProof: {
+        provider:     computeResult?.provider     || null,
+        model:        computeResult?.model        || null,
+        completionId: computeResult?.completionId || null,
+        zgResKey:     computeResult?.zgResKey     || null,
+      },
+      bundledAt: new Date().toISOString(),
+    };
+
+    let proofBundleCID = null;
+    try {
+      proofBundleCID = await this.storage.uploadData(
+        proofBundle,
+        `job-${jobId}-proof.json`
+      );
+      console.log(`[Portfolio] Proof bundle uploaded: ${proofBundleCID}`);
+    } catch (err) {
+      console.warn(`[Portfolio] Proof bundle upload failed: ${err.message}`);
+    }
+
+    const category = this._deriveCategory(jobBrief);
+    const summary  = `${category.replace(/_/g, " ")} task completed via 0G Compute (${computeResult?.model || "AI"})`;
+
+    try {
+      await fetch(`${frontendUrl}/api/agent-portfolio`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          agentId:        job.agentId.toString(),
+          jobId:          jobId.toString(),
+          category,
+          summary,
+          platforms:      jobBrief?.platforms   || [],
+          outputTypes:    jobBrief?.outputTypes || ["text"],
+          computeProvider: computeResult?.provider  || null,
+          computeModel:    computeResult?.model     || null,
+          zgResKey:        computeResult?.zgResKey  || null,
+          proofBundleCid:  proofBundleCID,
+          txHash,
+        }),
+        signal: AbortSignal.timeout(8000),
+      });
+      console.log(`[Portfolio] Entry recorded for job ${jobId}`);
+    } catch (err) {
+      console.warn(`[Portfolio] Record failed: ${err.message}`);
+    }
+  }
+
+  /** Derive task category from job brief content. */
+  _deriveCategory(jobBrief) {
+    const text = JSON.stringify(jobBrief || "").toLowerCase();
+    if (/video|youtube|tiktok|instagram|reel|content|creator/.test(text)) return "content_creation";
+    if (/trade|trading|market|stock|crypto|price|order/.test(text))       return "trading";
+    if (/code|develop|build|software|api|bug|feature/.test(text))         return "coding";
+    if (/research|analysis|report|study|investigate/.test(text))          return "research";
+    if (/write|article|blog|essay|copy|draft/.test(text))                 return "writing";
+    return "task";
   }
 
   /**
@@ -358,6 +431,9 @@ export class JobProcessor {
         phase: "completed", message: `Milestone ${milestoneIndex + 1} APPROVED! Payment released: ${ethers.formatEther(job.milestones[milestoneIndex].amountWei)} OG`,
         milestoneIndex, metadata: { txHash: receipt.hash },
       });
+
+      // Record portfolio entry with 0G Compute attestation proof
+      await this._recordPortfolioEntry(jobId, job, jobBrief, result, outputCID, receipt.hash);
     } catch (err) {
       console.error(`[Processor] Milestone submission failed:`, err.message?.slice(0, 120));
       await logActivity({
