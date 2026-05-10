@@ -620,6 +620,74 @@ async function builtinRiskManagement(skill, jobBrief) {
 }
 
 /**
+ * n8n_webhook — triggers an n8n workflow via webhook and returns its output.
+ *
+ * If webhookUrl is missing the skill emits a CREDENTIAL_REQUEST that the LLM
+ * relays to the user, asking them to provide the URL (and optional API key).
+ *
+ * skill.config:
+ *   { webhookUrl, apiKey?, uploadFilesToStorage? }
+ *
+ * n8n workflow should respond with JSON. Special keys surfaced as file outputs:
+ *   fileUrl | outputUrl | mp3Url | mp4Url | pdfUrl | audioUrl | videoUrl
+ */
+async function builtinN8nWebhook(skill, jobBrief) {
+  const webhookUrl = skill.config?.webhookUrl;
+  const apiKey = decryptApiKey(skill.config?.apiKey);
+
+  if (!webhookUrl) {
+    return (
+      `[n8n_webhook] CREDENTIAL_REQUEST\n` +
+      `This task requires an n8n automation workflow but no webhook URL is configured.\n\n` +
+      `Please ask the user to provide:\n` +
+      `  1. n8n Webhook URL  — open your n8n workflow → Webhook trigger node → copy the URL\n` +
+      `  2. n8n API key      — optional, only if your n8n instance uses header auth\n\n` +
+      `Once the user supplies these, update this skill's config and the workflow will run automatically.`
+    );
+  }
+
+  const payload = {
+    source: "zer0gig-agent",
+    timestamp: new Date().toISOString(),
+    brief: typeof jobBrief === "string" ? { task: jobBrief } : jobBrief,
+  };
+
+  const headers = { "Content-Type": "application/json" };
+  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+  console.log(`[ToolExecutor:n8n] Triggering webhook: ${webhookUrl.slice(0, 80)}`);
+
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    return `[n8n_webhook] Webhook failed: HTTP ${res.status} — ${errText.slice(0, 300)}`;
+  }
+
+  const ct = res.headers.get("content-type") || "";
+  if (!ct.includes("application/json")) {
+    const text = await res.text();
+    return `[n8n_webhook] Workflow completed:\n${text.slice(0, 3000)}`;
+  }
+
+  const data = await res.json();
+
+  // Surface file output URLs (MP3, MP4, PDF, etc.)
+  const FILE_KEYS = ["fileUrl", "outputUrl", "mp3Url", "mp4Url", "pdfUrl", "audioUrl", "videoUrl", "documentUrl"];
+  const files = FILE_KEYS.filter(k => data[k]).map(k => `  ${k}: ${data[k]}`);
+
+  let summary = `[n8n_webhook] Workflow completed.\n`;
+  if (files.length) summary += `\nOutput files:\n${files.join("\n")}\n`;
+  summary += `\nResponse:\n${JSON.stringify(data, null, 2).slice(0, 2000)}`;
+  return summary;
+}
+
+/**
  * email_send — sends email via SMTP (Gmail App Password, Outlook, custom SMTP).
  *
  * skill.config requires: { smtpHost, smtpPort, user, password, from, to }
@@ -691,6 +759,7 @@ async function executeBuiltinSkill(skill, jobBrief) {
     case "chart_patterns":    return builtinChartPatterns(skill, jobBrief);
     case "risk_management":   return builtinRiskManagement(skill, jobBrief);
     case "email_send":        return builtinEmailSend(skill, jobBrief);
+    case "n8n_webhook":       return builtinN8nWebhook(skill, jobBrief);
     default:
       console.warn(`[ToolExecutor] No handler for builtin skill: ${id}`);
       return `[${id}] Builtin handler not implemented yet.`;

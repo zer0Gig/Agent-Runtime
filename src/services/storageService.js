@@ -533,6 +533,47 @@ export class StorageService {
     );
   }
 
+  /**
+   * Upload a binary file (MP3, MP4, PDF, etc.) to 0G Storage.
+   * @param {Buffer} buffer - Raw file bytes
+   * @param {string} filename - e.g. "output.mp4"
+   * @returns {Promise<string>} root hash (CID)
+   */
+  async uploadBinaryFile(buffer, filename) {
+    const filePath = join(this.tmpDir, filename);
+    writeFileSync(filePath, buffer);
+    console.log(`[Storage] Uploading binary file ${filename} (${buffer.length} bytes)...`);
+
+    const file = await ZgFile.fromFilePath(filePath);
+    const [tree, treeErr] = await file.merkleTree();
+    if (treeErr) {
+      await file.close();
+      throw new Error(`Merkle tree error: ${treeErr}`);
+    }
+
+    const rootHash = tree.rootHash();
+    const [, uploadErr] = await this.indexer.upload(file, EVM_RPC, this.signer);
+    await file.close();
+    if (uploadErr) throw new Error(`Upload error: ${uploadErr}`);
+
+    console.log(`[Storage] Binary file uploaded. CID: ${rootHash}`);
+    return rootHash;
+  }
+
+  /**
+   * Bundle all activity log entries for a job and upload to 0G Storage.
+   * Call this at job completion to commit the full execution trace on-chain.
+   * @param {string} jobId
+   * @param {Array}  activities - Array of activity log rows from Supabase
+   * @returns {Promise<string>} root hash (CID)
+   */
+  async uploadActivityBundle(jobId, activities) {
+    return this.uploadData(
+      { jobId, bundledAt: new Date().toISOString(), count: activities.length, activities },
+      `job-${jobId}-activity-bundle.json`
+    );
+  }
+
   // ─── CHECKPOINT METHODS (for scheduler persistence) ─────────────────────
 
   /**

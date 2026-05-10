@@ -202,11 +202,52 @@ export class JobProcessor {
         await this.processMilestone(jobId, i, job, jobBrief);
       }
 
+      // After all milestones: commit full activity log bundle to 0G Storage (on-chain)
+      await this._uploadActivityBundleOnChain(jobId, job.agentId?.toString(), job.agentWallet);
+
       console.log(`[Processor] ========== JOB ${id} COMPLETE ==========\n`);
     } catch (err) {
       console.error(`[Processor] Error processing job ${id}:`, err.message);
     } finally {
       this.processing.delete(id);
+    }
+  }
+
+  /**
+   * Fetch all activity log entries for this job from Supabase, bundle them,
+   * and upload to 0G Storage. The resulting CID is the on-chain proof that
+   * the full execution trace was committed to the decentralised network.
+   */
+  async _uploadActivityBundleOnChain(jobId, agentId, agentWallet) {
+    const sbUrl = process.env.SUPABASE_URL;
+    const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+    if (!sbUrl || !sbKey) return;
+
+    try {
+      const res = await fetch(
+        `${sbUrl}/rest/v1/agent_activity?job_id=eq.${jobId}&order=created_at.asc&select=*`,
+        {
+          headers: { apikey: sbKey, Authorization: `Bearer ${sbKey}` },
+          signal: AbortSignal.timeout(8000),
+        }
+      );
+      if (!res.ok) return;
+
+      const activities = await res.json();
+      if (!activities?.length) return;
+
+      console.log(`[Processor] Uploading activity bundle (${activities.length} entries) to 0G...`);
+      const bundleCID = await this.storage.uploadActivityBundle(jobId.toString(), activities);
+      console.log(`[Processor] Activity bundle on-chain. CID: ${bundleCID}`);
+
+      await logActivity({
+        jobId: jobId.toString(), agentId, agentWallet,
+        phase: "activity_onchain",
+        message: `Execution log committed to 0G Storage (${activities.length} entries). CID: ${bundleCID.slice(0, 24)}...`,
+        metadata: { activityBundleCID: bundleCID, entryCount: activities.length },
+      });
+    } catch (err) {
+      console.warn(`[Processor] Activity bundle upload failed: ${err.message}`);
     }
   }
 
