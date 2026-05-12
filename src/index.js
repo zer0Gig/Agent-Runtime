@@ -118,7 +118,8 @@ const scheduler = new AgentScheduler({ alertDelivery, storageService: storage })
   // Initialize subscription escrow contract for alert delivery
   const SUBSCRIPTION_ESCROW_ABI = [
     "function drainPerAlert(uint256 subscriptionId, bytes calldata alertData) external",
-    "function getSubscription(uint256 subscriptionId) view returns (tuple(uint256 subscriptionId, address client, uint256 agentId, address agentWallet, string taskDescription, uint256 intervalSeconds, uint8 intervalMode, uint256 checkInRate, uint256 alertRate, uint256 balance, uint256 totalDrained, uint8 status, uint256 createdAt, uint256 lastCheckIn, uint256 pausedAt, uint256 gracePeriodEnds, uint256 gracePeriodSeconds, bool x402Enabled, uint8 x402VerificationMode, bytes clientX402Sig, string webhookUrl, uint256 proposedInterval))",
+    // OKX APP session-voucher schema (preview) — names cosmetic, storage slots unchanged; see docs/contracts/OKX_session_voucher_design.md
+    "function getSubscription(uint256 subscriptionId) view returns (tuple(uint256 subscriptionId, address client, uint256 agentId, address agentWallet, string taskDescription, uint256 intervalSeconds, uint8 intervalMode, uint256 checkInRate, uint256 alertRate, uint256 balance, uint256 totalDrained, uint8 status, uint256 createdAt, uint256 lastCheckIn, uint256 pausedAt, uint256 gracePeriodEnds, uint256 gracePeriodSeconds, bool sessionVoucherEnabled, uint8 voucherMode, bytes clientVoucherSig, string webhookUrl, uint256 proposedInterval))",
     "event AlertFired(uint256 indexed subscriptionId, uint256 indexed agentId, uint256 timestamp, bytes alertData, uint256 amountDrained)",
     // Subscription events (BUG-3 FIX: add missing event signatures)
     "event SubscriptionCreated(uint256 indexed subscriptionId, uint256 indexed agentId, address client, uint256 budget)",

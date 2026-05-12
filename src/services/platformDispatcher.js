@@ -48,7 +48,8 @@ const SUBSCRIPTION_ESCROW_ABI = [
   "function updateInterval(uint256 subId, uint32 newInterval) external",
   "function proposeInterval(uint256 subId, uint32 suggestedInterval) external",
   "function subscriptionTaskHash(uint256 subId) view returns (bytes32)",
-  "function getSubscription(uint256 subId) view returns (tuple(address client, uint64 agentId, uint8 status, uint8 intervalMode, uint8 x402VerificationMode, bool x402Enabled, address agentWallet, uint64 lastCheckIn, uint32 intervalSeconds, uint96 checkInRate, uint96 alertRate, uint64 createdAt, uint128 balance, uint128 totalDrained, uint64 pausedAt, uint64 gracePeriodEnds, uint32 gracePeriodSeconds, uint32 proposedInterval))",
+  // OKX APP session-voucher schema (preview); contract storage slots unchanged — see docs/contracts/OKX_session_voucher_design.md
+  "function getSubscription(uint256 subId) view returns (tuple(address client, uint64 agentId, uint8 status, uint8 intervalMode, uint8 voucherMode, bool sessionVoucherEnabled, address agentWallet, uint64 lastCheckIn, uint32 intervalSeconds, uint96 checkInRate, uint96 alertRate, uint64 createdAt, uint128 balance, uint128 totalDrained, uint64 pausedAt, uint64 gracePeriodEnds, uint32 gracePeriodSeconds, uint32 proposedInterval))",
   "event SubscriptionCreated(uint256 indexed subscriptionId, uint256 indexed agentId, address indexed client, uint128 budget, bytes32 taskHash)",
   "event SubscriptionPaused(uint256 indexed subscriptionId, bytes32 reason)",
   "event SubscriptionCancelled(uint256 indexed subscriptionId, bytes32 reason, uint128 refund)",

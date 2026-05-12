@@ -65,9 +65,9 @@ async function main() {
       checkInRate,
       alertRate,
       gracePeriod,
-      false,                // x402Enabled
-      0,                    // x402VerificationMode
-      "0x",                 // clientX402Sig (empty)
+      false,                // sessionVoucherEnabled (OKX APP session voucher)
+      0,                    // voucherMode (0 = Delegated, 1 = Explicit Confirm)
+      "0x",                 // clientVoucherSig (empty — runtime path lands post-demo)
       ethers.ZeroHash,      // webhookHash
       { value: budget, gasLimit: 800_000 }
     );

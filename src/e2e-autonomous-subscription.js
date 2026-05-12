@@ -26,8 +26,12 @@ dotenv.config();
 
 const __dir = dirname(fileURLToPath(import.meta.url));
 const SUB_ABI = [
-  "function createSubscription(uint256 agentId, bytes32 taskHash, uint32 intervalSeconds, uint96 checkInRate, uint96 alertRate, uint32 gracePeriodSeconds, bool x402Enabled, uint8 x402VerificationMode, bytes clientX402Sig, bytes32 webhookHash) payable returns (uint256)",
-  "function getSubscription(uint256 subId) view returns (tuple(address client, uint64 agentId, uint8 status, uint8 intervalMode, uint8 x402VerificationMode, bool x402Enabled, address agentWallet, uint64 lastCheckIn, uint32 intervalSeconds, uint96 checkInRate, uint96 alertRate, uint64 createdAt, uint128 balance, uint128 totalDrained, uint64 pausedAt, uint64 gracePeriodEnds, uint32 gracePeriodSeconds, uint32 proposedInterval))",
+  // NOTE: Field names "sessionVoucherEnabled / voucherMode / clientVoucherSig" are the OKX APP session-voucher
+  // schema (preview — runtime path lands post-demo). Contract still stores them under the legacy x402* slot
+  // names; ABI parameter names are cosmetic (function selector hashes only over types), so the rename is
+  // free and the call is identical. See: Project/docs/contracts/OKX_session_voucher_design.md
+  "function createSubscription(uint256 agentId, bytes32 taskHash, uint32 intervalSeconds, uint96 checkInRate, uint96 alertRate, uint32 gracePeriodSeconds, bool sessionVoucherEnabled, uint8 voucherMode, bytes clientVoucherSig, bytes32 webhookHash) payable returns (uint256)",
+  "function getSubscription(uint256 subId) view returns (tuple(address client, uint64 agentId, uint8 status, uint8 intervalMode, uint8 voucherMode, bool sessionVoucherEnabled, address agentWallet, uint64 lastCheckIn, uint32 intervalSeconds, uint96 checkInRate, uint96 alertRate, uint64 createdAt, uint128 balance, uint128 totalDrained, uint64 pausedAt, uint64 gracePeriodEnds, uint32 gracePeriodSeconds, uint32 proposedInterval))",
   "function totalSubscriptions() view returns (uint256)",
   "function cancelSubscription(uint256 subId) external",
   "event SubscriptionCreated(uint256 indexed subscriptionId, uint256 indexed agentId, address indexed client, uint128 budget, bytes32 taskHash)",
@@ -80,9 +84,9 @@ async function main() {
     CHECK_IN_RATE,                        // checkInRate
     ALERT_RATE,                           // alertRate
     GRACE,                                // gracePeriodSeconds
-    false,                                // x402Enabled
-    0,                                    // x402VerificationMode (AGENT_SIDE)
-    "0x",                                 // clientX402Sig
+    false,                                // sessionVoucherEnabled
+    0,                                    // voucherMode (0 = DELEGATED, 1 = EXPLICIT_CONFIRM)
+    "0x",                                 // clientVoucherSig (empty — runtime path lands post-demo)
     ethers.ZeroHash,                      // webhookHash (no webhook for this test)
     { value: BUDGET, gasLimit: 800_000 }
   );
