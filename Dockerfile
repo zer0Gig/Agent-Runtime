@@ -1,5 +1,5 @@
 # ── Builder Stage ──────────────────────────────────────────────
-FROM node:18-alpine AS builder
+FROM node:20-alpine AS builder
 
 WORKDIR /app
 
@@ -13,7 +13,7 @@ RUN npm ci
 COPY . .
 
 # ── Runtime Stage ──────────────────────────────────────────────
-FROM node:18-alpine AS runtime
+FROM node:20-alpine AS runtime
 
 # Add non-root user for security
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
