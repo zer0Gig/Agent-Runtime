@@ -28,10 +28,14 @@ async function main() {
   ];
 
   for (const key of requiredEnv) {
-    if (!process.env[key]) {
+    const val = process.env[key];
+    if (!val) {
       console.error(`[Platform] Missing required env: ${key}`);
       process.exit(1);
     }
+    // Debug: show length and first/last chars without leaking full key
+    const mask = val.length > 8 ? `${val.slice(0,4)}...${val.slice(-4)}` : "(too short)";
+    console.log(`[Platform] ${key} loaded: length=${val.length} value=${mask}`);
   }
 
   // PLATFORM_AGENT_IDS is optional — auto-discovery will find agents
@@ -52,7 +56,17 @@ async function main() {
   // ── Setup provider & wallet ──────────────────────────────────
   const rpcUrl = process.env.OG_NEWTON_RPC || "https://evmrpc-testnet.0g.ai";
   const provider = new ethers.JsonRpcProvider(rpcUrl);
-  const wallet = new ethers.Wallet(process.env.PLATFORM_PRIVATE_KEY, provider);
+
+  // Validate private key format before creating wallet
+  const pk = process.env.PLATFORM_PRIVATE_KEY;
+  if (pk.includes("<UNKNOWN>") || pk.includes("your_") || pk.includes("placeholder")) {
+    console.error("[Platform] PLATFORM_PRIVATE_KEY contains placeholder text!");
+    console.error(`[Platform] Current value starts with: "${pk.slice(0,20)}..."`);
+    console.error("[Platform] Please set the real private key in Railway Dashboard → Variables");
+    process.exit(1);
+  }
+
+  const wallet = new ethers.Wallet(pk, provider);
 
   const blockNumber = await provider.getBlockNumber();
   const balance = await provider.getBalance(wallet.address);
