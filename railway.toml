@@ -4,7 +4,6 @@ environment = "production"
 
 [deploy]
 region = "singapore"
-runtime = "node"
 startCommand = "npm run start:platform"
 healthcheckPath = "/health"
 healthcheckTimeout = 30
