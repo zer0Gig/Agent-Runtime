@@ -1040,6 +1040,191 @@ async function builtinEmailSend(skill, jobBrief) {
   }
 }
 
+// ─── RARE & HIGH-VALUE SKILL HANDLERS ───────────────────────────────────────
+
+/**
+ * marketstack — Global stock market data (EOD, intraday, real-time, EDGAR).
+ * Documentation: Docs/RESOURCES/finance/Dokumentasi Lengkap Marketstack API v2.0.0.md
+ */
+async function builtinMarketstack(skill, jobBrief) {
+  const apiKey = decryptApiKey(skill.config?.apiKey) || process.env.MARKETSTACK_API_KEY;
+  const endpoint = skill.config?.endpoint || "https://api.marketstack.com/v2";
+  const symbol = skill.config?.symbol || jobBrief.metadata?.symbol || "AAPL";
+  const dataType = skill.config?.dataType || "eod"; // eod | intraday | stockprice
+
+  if (!apiKey) return "[marketstack] No API key configured. Set MARKETSTACK_API_KEY env var or skill config.";
+
+  try {
+    let url;
+    if (dataType === "eod") {
+      url = `${endpoint}/eod/latest?access_key=${apiKey}&symbols=${symbol}`;
+    } else if (dataType === "intraday") {
+      url = `${endpoint}/intraday/latest?access_key=${apiKey}&symbols=${symbol}&interval=1hour`;
+    } else {
+      url = `${endpoint}/stockprice?access_key=${apiKey}&ticker=${symbol}`;
+    }
+
+    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+
+    const item = data.data?.[0];
+    if (!item) return `[marketstack] No data returned for ${symbol}.`;
+
+    const lines = [
+      `📈 Marketstack ${dataType.toUpperCase()} — ${symbol}`,
+      `  Open:     ${item.open}`,
+      `  High:     ${item.high}`,
+      `  Low:      ${item.low}`,
+      `  Close:    ${item.close}`,
+      `  Volume:   ${item.volume}`,
+    ];
+    if (item.adj_close) lines.push(`  Adj Close: ${item.adj_close}`);
+    if (item.split_factor) lines.push(`  Split Factor: ${item.split_factor}`);
+    if (item.dividend) lines.push(`  Dividend: ${item.dividend}`);
+    lines.push(`  Date: ${item.date || item.trade_last || "N/A"}`);
+
+    return lines.join("\n");
+  } catch (err) {
+    return `[marketstack] Error: ${err.message}`;
+  }
+}
+
+/**
+ * aletheia — Insider trading, earnings calls, financial statements.
+ * Rare alternative data for alpha generation.
+ */
+async function builtinAletheia(skill, jobBrief) {
+  const apiKey = decryptApiKey(skill.config?.apiKey) || process.env.ALETHEIA_API_KEY;
+  const symbol = skill.config?.symbol || jobBrief.metadata?.symbol || "AAPL";
+  const dataType = skill.config?.dataType || "insider"; // insider | earnings | financials
+
+  if (!apiKey) return "[aletheia] No API key configured. Set ALETHEIA_API_KEY env var or skill config.";
+
+  try {
+    let url;
+    if (dataType === "insider") {
+      url = `https://api.aletheiaapi.com/InsiderTrades?symbol=${symbol}&pageSize=5`;
+    } else if (dataType === "earnings") {
+      url = `https://api.aletheiaapi.com/Earnings?symbol=${symbol}&pageSize=5`;
+    } else {
+      url = `https://api.aletheiaapi.com/BalanceSheet?symbol=${symbol}`;
+    }
+
+    const res = await fetch(url, { headers: { "Authorization": `Bearer ${apiKey}` }, signal: AbortSignal.timeout(10000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+
+    if (dataType === "insider") {
+      const trades = (data || []).slice(0, 3).map(t =>
+        `  • ${t.insiderName || "Unknown"}: ${t.transactionType} ${t.shares} shares @ $${t.price} (${t.transactionDate})`
+      ).join("\n");
+      return `📰 Aletheia Insider Trades — ${symbol}:\n${trades || "No recent insider trades."}`;
+    } else if (dataType === "earnings") {
+      const reports = (data || []).slice(0, 3).map(e =>
+        `  • ${e.fiscalDateEnding}: EPS ${e.reportedEPS} (Est ${e.estimatedEPS || "N/A"}), Rev $${e.totalRevenue}`
+      ).join("\n");
+      return `📊 Aletheia Earnings — ${symbol}:\n${reports || "No earnings data."}`;
+    } else {
+      return `📋 Aletheia Financials — ${symbol}:\n${JSON.stringify(data, null, 2).slice(0, 2000)}`;
+    }
+  } catch (err) {
+    return `[aletheia] Error: ${err.message}`;
+  }
+}
+
+/**
+ * wolfram_alpha — Symbolic computation, math, science, data analysis.
+ * Turns the agent into a super-intelligent computational engine.
+ */
+async function builtinWolframAlpha(skill, jobBrief) {
+  const appId = decryptApiKey(skill.config?.appId) || process.env.WOLFRAM_APP_ID;
+  const query = skill.config?.query || jobBrief.metadata?.wolframQuery || (typeof jobBrief === "string" ? jobBrief : jobBrief.description);
+
+  if (!appId) return "[wolfram_alpha] No App ID configured. Set WOLFRAM_APP_ID env var or skill config.";
+  if (!query) return "[wolfram_alpha] No query provided.";
+
+  try {
+    const url = `https://api.wolframalpha.com/v2/query?input=${encodeURIComponent(query)}&format=plaintext&output=JSON&appid=${appId}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+
+    const pods = data.queryresult?.pods || [];
+    if (pods.length === 0) return `[wolfram_alpha] No results for: ${query}`;
+
+    const results = pods.slice(0, 5).map(pod => {
+      const text = pod.subpods?.map(sp => sp.plaintext).filter(Boolean).join("; ");
+      return `  [${pod.title}]\n    ${text || "(no plaintext)"}`;
+    }).join("\n");
+
+    return `🔬 WolframAlpha — "${query}":\n${results}`;
+  } catch (err) {
+    return `[wolfram_alpha] Error: ${err.message}`;
+  }
+}
+
+/**
+ * shodan — Search engine for Internet-connected devices.
+ * OSINT / cybersecurity scanning. Extremely rare for AI agents.
+ */
+async function builtinShodan(skill, jobBrief) {
+  const apiKey = decryptApiKey(skill.config?.apiKey) || process.env.SHODAN_API_KEY;
+  const query = skill.config?.query || jobBrief.metadata?.shodanQuery || (typeof jobBrief === "string" ? jobBrief : jobBrief.description);
+
+  if (!apiKey) return "[shodan] No API key configured. Set SHODAN_API_KEY env var or skill config.";
+  if (!query) return "[shodan] No search query provided.";
+
+  try {
+    const url = `https://api.shodan.io/shodan/host/search?key=${apiKey}&query=${encodeURIComponent(query)}&limit=5`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+
+    const matches = (data.matches || []).slice(0, 5).map(m => {
+      const ip = m.ip_str;
+      const org = m.org || "Unknown";
+      const os = m.os || "Unknown";
+      const ports = m.port;
+      const hostnames = (m.hostnames || []).join(", ") || "N/A";
+      return `  • ${ip}:${ports} — ${org} | OS: ${os} | Hosts: ${hostnames}`;
+    }).join("\n");
+
+    return `🔍 Shodan Search — "${query}" (${data.total || 0} total results):\n${matches || "No matches found."}`;
+  } catch (err) {
+    return `[shodan] Error: ${err.message}`;
+  }
+}
+
+/**
+ * marketaux — Live stock market news with sentiment analysis.
+ * Alternative data for market-moving events.
+ */
+async function builtinMarketAux(skill, jobBrief) {
+  const apiKey = decryptApiKey(skill.config?.apiKey) || process.env.MARKETAUX_API_KEY;
+  const symbol = skill.config?.symbol || jobBrief.metadata?.symbol || "AAPL";
+  const limit = skill.config?.limit || 5;
+
+  if (!apiKey) return "[marketaux] No API key configured. Set MARKETAUX_API_KEY env var or skill config.";
+
+  try {
+    const url = `https://api.marketaux.com/v1/news/all?symbols=${symbol}&filter_entities=true&language=en&api_token=${apiKey}&limit=${limit}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+
+    const articles = (data.data || []).slice(0, limit).map(a => {
+      const sentiment = a.entities?.[0]?.sentiment_score || 0;
+      const sentimentLabel = sentiment > 0.2 ? "🟢 Bullish" : sentiment < -0.2 ? "🔴 Bearish" : "⚪ Neutral";
+      return `  • ${a.title}\n    ${a.description?.slice(0, 120) || ""}…\n    Sentiment: ${sentimentLabel} (${sentiment.toFixed(2)}) | Source: ${a.source} | ${a.published_at}`;
+    }).join("\n\n");
+
+    return `📰 MarketAux News — ${symbol}:\n${articles || "No news found."}`;
+  } catch (err) {
+    return `[marketaux] Error: ${err.message}`;
+  }
+}
+
 /** Dispatch to the correct builtin handler. */
 async function executeBuiltinSkill(skill, jobBrief, storageService = null) {
   const id = skill.id || skill.skill_id || "";
@@ -1057,6 +1242,11 @@ async function executeBuiltinSkill(skill, jobBrief, storageService = null) {
     case "email_send":        return builtinEmailSend(skill, jobBrief);
     case "n8n_webhook":       return builtinN8nWebhook(skill, jobBrief, storageService);
     case "n8n_manager":       return builtinN8nManager(skill, jobBrief);
+    case "marketstack":       return builtinMarketstack(skill, jobBrief);
+    case "aletheia":          return builtinAletheia(skill, jobBrief);
+    case "wolfram_alpha":     return builtinWolframAlpha(skill, jobBrief);
+    case "shodan":            return builtinShodan(skill, jobBrief);
+    case "marketaux":         return builtinMarketAux(skill, jobBrief);
     default:
       console.warn(`[ToolExecutor] No handler for builtin skill: ${id}`);
       return `[${id}] Builtin handler not implemented yet.`;
