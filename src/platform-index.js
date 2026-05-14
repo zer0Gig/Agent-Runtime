@@ -49,7 +49,14 @@ async function main() {
   if (process.env.AGENT_WALLET_KEYS) {
     for (const entry of process.env.AGENT_WALLET_KEYS.split(",")) {
       const [id, key] = entry.trim().split(":");
-      if (id && key) agentWalletKeys[id.trim()] = key.trim();
+      if (id && key) {
+        // Railway sometimes reverts env vars to placeholder text — skip those
+        if (key.includes("your_") || key.includes("placeholder") || key.includes("<UNKNOWN>")) {
+          console.warn(`[Platform] Skipping placeholder key for agent ${id}`);
+          continue;
+        }
+        agentWalletKeys[id.trim()] = key.trim();
+      }
     }
   }
 
