@@ -90,12 +90,27 @@ async function fetchManifestFromSupabase(agentId) {
   if (!sbUrl || !sbKey) return null;
   try {
     const res = await fetch(
-      `${sbUrl}/rest/v1/agent_profiles?agent_id=eq.${agentId}&select=metadata`,
+      `${sbUrl}/rest/v1/agent_profiles?agent_id=eq.${agentId}&select=metadata,encrypted_wallet_key`,
       { headers: { apikey: sbKey, Authorization: `Bearer ${sbKey}` } }
     );
     if (!res.ok) return null;
     const rows = await res.json();
-    return rows?.[0]?.metadata ?? null;
+    return rows?.[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Decrypt an ECIES-encrypted hex blob using the platform private key */
+function decryptSecret(encryptedHex) {
+  const { decrypt: eciesDecrypt } = require("eciesjs");
+  const sk = process.env.PLATFORM_ENCRYPTION_PRIVATE_KEY;
+  if (!sk || !encryptedHex) return null;
+  try {
+    const skHex = sk.startsWith("0x") ? sk.slice(2) : sk;
+    const cipher = Buffer.from(encryptedHex.slice(2), "hex");
+    const plain = eciesDecrypt(skHex, cipher);
+    return Buffer.from(plain).toString("utf8");
   } catch {
     return null;
   }
@@ -155,6 +170,54 @@ export class PlatformDispatcher {
   }
 
   /**
+   * Auto-fetch and decrypt agent wallet keys from Supabase.
+   * Replaces manual AGENT_WALLET_KEYS env var — wallet keys are encrypted
+   * at registration time and stored in agent_profiles.encrypted_wallet_key.
+   */
+  async _loadWalletKeysFromSupabase() {
+    const sbUrl = process.env.SUPABASE_URL;
+    const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!sbUrl || !sbKey) {
+      console.log("[PlatformDispatcher] No Supabase credentials — skipping wallet key fetch");
+      return;
+    }
+
+    try {
+      // Fetch all agent profiles that have an encrypted wallet key
+      const res = await fetch(
+        `${sbUrl}/rest/v1/agent_profiles?encrypted_wallet_key=not.is.null&select=agent_id,encrypted_wallet_key`,
+        { headers: { apikey: sbKey, Authorization: `Bearer ${sbKey}` } }
+      );
+      if (!res.ok) {
+        console.warn(`[PlatformDispatcher] Supabase wallet key fetch failed: ${res.status}`);
+        return;
+      }
+      const rows = await res.json();
+      if (!rows?.length) {
+        console.log("[PlatformDispatcher] No encrypted wallet keys found in Supabase");
+        return;
+      }
+
+      let loaded = 0;
+      for (const row of rows) {
+        const agentIdStr = String(row.agent_id);
+        const decrypted = decryptSecret(row.encrypted_wallet_key);
+        if (!decrypted) {
+          console.warn(`[PlatformDispatcher] Failed to decrypt wallet key for Agent ${agentIdStr}`);
+          continue;
+        }
+        const normalizedKey = decrypted.startsWith("0x") ? decrypted : `0x${decrypted}`;
+        this.agentWallets.set(agentIdStr, new ethers.Wallet(normalizedKey, this.provider));
+        loaded++;
+        console.log(`[PlatformDispatcher] Loaded wallet key for Agent ${agentIdStr} from Supabase`);
+      }
+      console.log(`[PlatformDispatcher] Wallet keys loaded: ${loaded} from Supabase, ${this.agentWallets.size} total`);
+    } catch (err) {
+      console.error(`[PlatformDispatcher] Wallet key fetch failed: ${err.message}`);
+    }
+  }
+
+  /**
    * Starts the dispatcher.
    * 1. Loads pre-configured agent configs (from PLATFORM_AGENT_IDS env).
    * 2. Scans the registry for ALL platform-managed agents (auto-discovery).
@@ -171,6 +234,9 @@ export class PlatformDispatcher {
       console.log(`[PlatformDispatcher] Pre-configured agents: ${Array.from(this.managedAgentIds).join(", ")}`);
       await this._loadAllAgentConfigs();
     }
+
+    // Phase 1.5: Auto-fetch wallet keys from Supabase (replaces AGENT_WALLET_KEYS env var)
+    await this._loadWalletKeysFromSupabase();
 
     // Phase 2: Auto-discovery — scan the entire registry for platform-managed agents
     console.log("[PlatformDispatcher] Scanning AgentRegistry for platform-managed agents...");
