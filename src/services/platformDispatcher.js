@@ -12,6 +12,7 @@
  */
 
 import { ethers } from "ethers";
+import { decrypt as eciesDecrypt } from "eciesjs";
 import { StorageService } from "./storageService.js";
 import { PlatformJobProcessor } from "./platformJobProcessor.js";
 import { CustomerServiceBot } from "./telegramConnector.js";
@@ -103,7 +104,6 @@ async function fetchManifestFromSupabase(agentId) {
 
 /** Decrypt an ECIES-encrypted hex blob using the platform private key */
 function decryptSecret(encryptedHex) {
-  const { decrypt: eciesDecrypt } = require("eciesjs");
   const sk = process.env.PLATFORM_ENCRYPTION_PRIVATE_KEY;
   if (!sk || !encryptedHex) return null;
   try {
