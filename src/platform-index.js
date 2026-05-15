@@ -198,7 +198,7 @@ function startHealthCheck(port = parseInt(process.env.PORT || "10000"), dispatch
           hasSupabase: !!process.env.SUPABASE_URL,
           hasPlatformKey: !!process.env.PLATFORM_PRIVATE_KEY,
           hasEncryptionKey: !!process.env.PLATFORM_ENCRYPTION_PRIVATE_KEY,
-          hasAgentWalletsLoaded: this.dispatcher.agentWallets.size,
+          hasAgentWalletsLoaded: dispatcher?.agentWallets?.size || 0,
           hasAgentWalletKeys: !!process.env.AGENT_WALLET_KEYS,
           hasTelegramToken: !!process.env.TELEGRAM_BOT_TOKEN,
           rpcUrl: process.env.OG_NEWTON_RPC || "default",
