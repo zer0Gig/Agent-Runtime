@@ -200,6 +200,7 @@ export async function runFeedbackLoop(
       console.log(`[PlatformProcessor] ${userMessages.length} user message(s) — interpreting...`);
 
       let intent = "UNKNOWN";
+      let llmFailed = false;
       try {
         const result = await extendedCompute.processTask(
           `You are an AI freelance agent. You completed a milestone and the client has responded.
@@ -221,9 +222,22 @@ Reply with only "APPROVED" or "REVISION: ..." — nothing else.`,
         if (raw.toUpperCase().startsWith("APPROVED")) intent = "APPROVED";
         else if (raw.toUpperCase().startsWith("REVISION")) intent = raw;
       } catch {
-        // On LLM failure, ask the user to use the button directly
-        await postChat(jobId, "I had trouble interpreting your message. If you're satisfied, please click the 'Go to Next Milestone' button above to proceed.");
-        continue;
+        llmFailed = true;
+      }
+
+      // Fallback: keyword-based intent classification when LLM is unavailable
+      if (llmFailed && intent === "UNKNOWN") {
+        const lower = chatText.toLowerCase();
+        const approvalWords = ["approve", "approved", "good", "great", "perfect", "nice", "ok", "okay", "yes", "proceed", "continue", "next", "satisfied", "happy", "looks good", "well done", "thanks", "thank", "go ahead", "release", "button", "click"];
+        const isApproval = approvalWords.some(w => lower.includes(w));
+
+        if (isApproval) {
+          intent = "APPROVED";
+        } else {
+          // Treat anything else as a revision request
+          intent = `REVISION: ${chatText.trim()}`;
+        }
+        console.log(`[PlatformProcessor] LLM unavailable — keyword fallback intent: ${intent}`);
       }
 
       console.log(`[PlatformProcessor] Intent: ${intent}`);
@@ -679,7 +693,7 @@ Incorporate any n8n workflow outputs from the tool context into your deliverable
     });
 
     // Build a short output summary for the chat (first 800 chars)
-    const outputSummary = result.content.length > 800
+    let outputSummary = result.content.length > 800
       ? result.content.slice(0, 800) + "…"
       : result.content;
 
@@ -697,27 +711,108 @@ Incorporate any n8n workflow outputs from the tool context into your deliverable
     }
 
     let feedbackResult = { userFeedback: "" };
-    try {
-      feedbackResult = await runFeedbackLoop(
-        id,
-        milestoneIndex,
-        outputSummary,
-        this.extendedCompute,
-        telegramChatId,
-        undefined,                  // timeoutMs — use default 1h
-        alignmentScore,             // pass score to the loop
-        signature && signature !== "0x" // alignmentSigned flag — true if we already signed
-      ) || feedbackResult;
-    } catch (timeoutErr) {
-      console.error(`[PlatformProcessor] ${timeoutErr.message}`);
-      feedbackResult.userFeedback = timeoutErr.userFeedback || "";
-      await logActivity({
-        jobId: id, agentId, agentWallet,
-        phase: "error",
-        message: `Milestone ${milestoneIndex + 1} feedback loop timed out.`,
-        milestoneIndex,
-      });
-      return;
+    let revisionCount = 0;
+    const MAX_REVISION_EXECUTIONS = 2;
+
+    // Feedback loop — may return revision requests that require re-execution
+    while (true) {
+      try {
+        feedbackResult = await runFeedbackLoop(
+          id,
+          milestoneIndex,
+          outputSummary,
+          this.extendedCompute,
+          telegramChatId,
+          undefined,                  // timeoutMs — use default 1h
+          alignmentScore,             // pass score to the loop
+          signature && signature !== "0x" // alignmentSigned flag — true if we already signed
+        ) || feedbackResult;
+      } catch (timeoutErr) {
+        console.error(`[PlatformProcessor] ${timeoutErr.message}`);
+        feedbackResult.userFeedback = timeoutErr.userFeedback || "";
+        await logActivity({
+          jobId: id, agentId, agentWallet,
+          phase: "error",
+          message: `Milestone ${milestoneIndex + 1} feedback loop timed out.`,
+          milestoneIndex,
+        });
+        return;
+      }
+
+      // If user requested revision, re-execute the milestone
+      if (feedbackResult.path === "revision" && revisionCount < MAX_REVISION_EXECUTIONS) {
+        revisionCount++;
+        const revisionDetails = feedbackResult.revisionDetails || "";
+        console.log(`[PlatformProcessor] Re-executing milestone ${milestoneIndex + 1} — revision ${revisionCount}: ${revisionDetails}`);
+
+        await logActivity({
+          jobId: id, agentId, agentWallet,
+          phase: "revision",
+          message: `Revision ${revisionCount}: ${revisionDetails.slice(0, 200)}`,
+          milestoneIndex,
+        });
+
+        // Re-run LLM with revision feedback appended to prompt
+        const revisionPrompt = `${taskDescription}\n\nThe client requested changes: "${revisionDetails}". Please revise your output accordingly.`;
+        try {
+          result = await this.extendedCompute.processTask(revisionPrompt, memoryContext, toolContext);
+          console.log(`[PlatformProcessor] Revision ${revisionCount} LLM response: ${result.content.length} chars via ${result.provider}`);
+        } catch (err) {
+          console.log(`[PlatformProcessor] Revision ${revisionCount} compute error: ${err.message}`);
+          result = {
+            content: `[Agent Output] Milestone ${milestoneIndex + 1}/${totalMilestones} revised based on your feedback: "${revisionDetails}"`,
+            model: "fallback",
+            provider: "fallback",
+          };
+        }
+
+        // Update output summary for next feedback loop iteration
+        outputSummary = result.content.length > 800
+          ? result.content.slice(0, 800) + "…"
+          : result.content;
+
+        // Log revised output
+        await logActivity({
+          jobId: id, agentId, agentWallet,
+          phase: "agent_output",
+          message: `Milestone ${milestoneIndex + 1} revision ${revisionCount} output ready (${result.content.length} chars via ${result.model})`,
+          milestoneIndex,
+          metadata: { content: result.content, model: result.model, provider: result.provider },
+        });
+
+        // Send revised output as chat message
+        await sendChatMessage({
+          jobId: Number(id),
+          message: result.content,
+          msgType: "text",
+          metadata: { model: result.model, provider: result.provider, milestoneIndex, revision: revisionCount },
+        });
+
+        // Upload revised output
+        const revisedOutput = {
+          jobId: id,
+          milestoneIndex,
+          content: result.content,
+          model: result.model,
+          provider: result.provider,
+          timestamp: new Date().toISOString(),
+          revision: revisionCount,
+        };
+
+        try {
+          outputCID = await this.storage.uploadMilestoneOutput(id, milestoneIndex, revisedOutput);
+          console.log(`[PlatformProcessor] Revision ${revisionCount} output uploaded. CID: ${outputCID}`);
+        } catch (err) {
+          console.log(`[PlatformProcessor] Revision ${revisionCount} storage upload error: ${err.message}`);
+          outputCID = `mock-cid-job${id}-m${milestoneIndex}-rev${revisionCount}-${Date.now()}`;
+        }
+
+        // Continue feedback loop with revised output
+        continue;
+      }
+
+      // No revision request (or max revisions reached) — break out
+      break;
     }
 
     // 7. Save memory — extract learnings from chat feedback
