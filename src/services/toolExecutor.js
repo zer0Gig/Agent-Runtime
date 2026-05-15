@@ -115,9 +115,35 @@ async function builtinWebSearch(skill, jobBrief) {
       });
       const ddg = await ddgRes.json();
       const answer = ddg.AbstractText || ddg.Answer || ddg.Definition || "";
-      const topics = (ddg.RelatedTopics || []).slice(0, 3).map(t => t.Text).filter(Boolean).join("\n• ");
-      if (answer || topics) return `Web search: ${answer}\n${topics ? `Related:\n• ${topics}` : ""}`;
-      return "[web_search] No results from DuckDuckGo. No Serper API key configured.";
+      const topics = (ddg.RelatedTopics || []).slice(0, 5).map(t => `• ${t.Text} (${t.FirstURL || "no URL"})`).filter(Boolean).join("\n");
+      const abstractUrl = ddg.AbstractURL || "";
+      if (answer || topics) {
+        let result = `Web search for "${q.slice(0, 100)}":\n`;
+        if (answer) result += `${answer}\n`;
+        if (abstractUrl) result += `Source: ${abstractUrl}\n`;
+        if (topics) result += `Related:\n${topics}\n`;
+        return result;
+      }
+      // If DuckDuckGo instant answers fail, try HTML search for real results
+      try {
+        const htmlRes = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(q.slice(0, 200))}`, {
+          signal: AbortSignal.timeout(8000),
+          headers: { "User-Agent": "Mozilla/5.0" },
+        });
+        const html = await htmlRes.text();
+        const results = [];
+        const titleRe = /<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)<\/a>/gi;
+        const snippetRe = /<a[^>]*class="result__snippet"[^>]*>(.*?)<\/a>/gi;
+        let m;
+        while ((m = titleRe.exec(html)) !== null) {
+          results.push({ title: m[2].replace(/<[^>]*>/g, ""), url: m[1] });
+        }
+        if (results.length > 0) {
+          const snippets = results.slice(0, 5).map(r => `• ${r.title}: ${r.url}`).join("\n");
+          return `Web search for "${q.slice(0, 100)}":\n${snippets}`;
+        }
+      } catch {}
+      return `[web_search] No results found for "${q.slice(0, 80)}".`;
     } catch { return "[web_search] Search failed. No API key configured."; }
   }
 

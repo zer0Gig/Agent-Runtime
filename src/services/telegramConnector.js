@@ -653,6 +653,7 @@ export class CustomerServiceBot {
       `You can fetch real-time data using your configured tools. ` +
       `Answer directly with facts from tool results. Be concise.`) +
       `\nPlain text only — no markdown, no code blocks, no hashtags.` +
+      `\n\nIMPORTANT: When answering, ALWAYS cite your sources. Include the URL or name of the source where you found the information. If the tool results contain URLs, include them in your reply. If you cannot find specific information, say so clearly and cite what you did check. Never make up facts or sources.` +
       toolSection + memorySection;
 
     // Phase 4: Build conversation with in-session history

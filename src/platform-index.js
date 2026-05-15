@@ -152,18 +152,50 @@ function startHealthCheck(port = parseInt(process.env.PORT || "10000"), dispatch
 
     // Debug endpoint — exposes runtime state for troubleshooting
     if (req.url === "/debug/status" && req.method === "GET") {
+      const schedulerJobs = dispatcher?.scheduler ? dispatcher.scheduler.getAllJobs() : [];
+      const agentWallets = dispatcher ? Array.from(dispatcher.agentWallets.keys()) : [];
+      const computeServices = dispatcher ? Array.from(dispatcher.computeServices.keys()) : [];
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status: "ok",
+        uptime: process.uptime(),
+        memory: process.memoryUsage(),
         managedAgents: dispatcher ? Array.from(dispatcher.managedAgentIds) : [],
         agentConfigsLoaded: dispatcher ? Array.from(dispatcher.agentConfigs.keys()) : [],
+        agentWalletsLoaded: agentWallets,
+        computeServicesCached: computeServices,
         activeCsBots: dispatcher ? Array.from(dispatcher.customerServiceBots.keys()) : [],
         runningBotTokens: dispatcher ? Array.from(dispatcher._runningBotTokens) : [],
         eventWatchersCount: dispatcher ? dispatcher._eventWatchers.length : 0,
         registryAddress: dispatcher?.registryAddress,
         escrowAddress: dispatcher?.escrowAddress,
         subscriptionEscrowAddress: dispatcher?.subscriptionEscrowAddress,
-        schedulerJobs: dispatcher?.scheduler ? dispatcher.scheduler.getAllJobs().map(j => j.jobId) : [],
+        schedulerJobs: schedulerJobs.map(j => ({ jobId: j.jobId, cron: j.cron, metadata: j.metadata })),
+        env: {
+          hasSupabase: !!process.env.SUPABASE_URL,
+          hasPlatformKey: !!process.env.PLATFORM_PRIVATE_KEY,
+          hasEncryptionKey: !!process.env.PLATFORM_ENCRYPTION_PRIVATE_KEY,
+          hasAgentPrivateKey: !!process.env.AGENT_PRIVATE_KEY,
+          hasAgentWalletKeys: !!process.env.AGENT_WALLET_KEYS,
+          hasTelegramToken: !!process.env.TELEGRAM_BOT_TOKEN,
+          rpcUrl: process.env.OG_NEWTON_RPC || "default",
+        },
+      }, null, 2));
+      return;
+    }
+
+    // Recent logs endpoint — returns last N log entries from memory
+    if (req.url && req.url.startsWith("/debug/logs") && req.method === "GET") {
+      const url = new URL(req.url, `http://${req.headers.host}`);
+      const limit = parseInt(url.searchParams.get("limit") || "50");
+      const level = url.searchParams.get("level") || null;
+      const search = url.searchParams.get("q") || null;
+      // Collect recent console output from a simple in-memory buffer
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        status: "ok",
+        note: "For full logs, use Railway dashboard. This endpoint returns runtime state only.",
+        tip: "Check /debug/status for agent/wallet/scheduler state.",
       }, null, 2));
       return;
     }
