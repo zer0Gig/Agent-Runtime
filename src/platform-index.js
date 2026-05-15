@@ -207,6 +207,38 @@ function startHealthCheck(port = parseInt(process.env.PORT || "10000"), dispatch
       return;
     }
 
+    // Trigger recovery — force re-scan on-chain for missed jobs/subscriptions
+    if (req.url === "/debug/trigger-recover" && req.method === "POST") {
+      let body = "";
+      req.on("data", chunk => { body += chunk; });
+      req.on("end", async () => {
+        try {
+          const params = body ? JSON.parse(body) : {};
+          const results = {};
+
+          if (dispatcher) {
+            if (params.jobs !== false) {
+              await dispatcher._recoverJobs();
+              results.jobs = "recovered";
+            }
+            if (params.subscriptions !== false) {
+              await dispatcher._recoverSubscriptions();
+              results.subscriptions = "recovered";
+            }
+            results.managedAgents = Array.from(dispatcher.managedAgentIds);
+            results.walletsLoaded = Array.from(dispatcher.agentWallets.keys());
+          }
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "ok", results }, null, 2));
+        } catch (err) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "error", message: err.message }, null, 2));
+        }
+      });
+      return;
+    }
+
     // Recent logs endpoint — returns in-memory log buffer
     if (req.url && req.url.startsWith("/debug/logs") && req.method === "GET") {
       const url = new URL(req.url, `http://${req.headers.host}`);
