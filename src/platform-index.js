@@ -150,6 +150,24 @@ function startHealthCheck(port = parseInt(process.env.PORT || "10000"), dispatch
       return;
     }
 
+    // Debug endpoint — exposes runtime state for troubleshooting
+    if (req.url === "/debug/status" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        status: "ok",
+        managedAgents: dispatcher ? Array.from(dispatcher.managedAgentIds) : [],
+        agentConfigsLoaded: dispatcher ? Array.from(dispatcher.agentConfigs.keys()) : [],
+        activeCsBots: dispatcher ? Array.from(dispatcher.customerServiceBots.keys()) : [],
+        runningBotTokens: dispatcher ? Array.from(dispatcher._runningBotTokens) : [],
+        eventWatchersCount: dispatcher ? dispatcher._eventWatchers.length : 0,
+        registryAddress: dispatcher?.registryAddress,
+        escrowAddress: dispatcher?.escrowAddress,
+        subscriptionEscrowAddress: dispatcher?.subscriptionEscrowAddress,
+        schedulerJobs: dispatcher?.scheduler ? dispatcher.scheduler.getAllJobs().map(j => j.jobId) : [],
+      }, null, 2));
+      return;
+    }
+
     // Telegram webhook endpoint — only active when TELEGRAM_WEBHOOK_URL is set
     if (req.url === "/telegram-webhook" && req.method === "POST" && bot) {
       // Validate secret token (Telegram sends it as X-Telegram-Bot-Api-Secret-Token)
