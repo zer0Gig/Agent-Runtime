@@ -400,12 +400,48 @@ export class PlatformDispatcher {
   }
 
   /**
+   * Load and decrypt wallet key for a single agent from Supabase.
+   * Called when a new agent is auto-discovered after startup.
+   */
+  async _loadWalletKeyForAgent(agentId) {
+    const agentIdStr = String(agentId);
+    if (this.agentWallets.has(agentIdStr)) return; // already loaded
+
+    const sbUrl = process.env.SUPABASE_URL;
+    const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!sbUrl || !sbKey) return;
+
+    try {
+      const res = await fetch(
+        `${sbUrl}/rest/v1/agent_profiles?agent_id=eq.${agentId}&select=encrypted_wallet_key`,
+        { headers: { apikey: sbKey, Authorization: `Bearer ${sbKey}` } }
+      );
+      if (!res.ok) return;
+      const rows = await res.json();
+      const row = rows?.[0];
+      if (!row?.encrypted_wallet_key) return;
+
+      const decrypted = decryptSecret(row.encrypted_wallet_key);
+      if (!decrypted) {
+        console.warn(`[PlatformDispatcher] Failed to decrypt wallet key for Agent ${agentIdStr}`);
+        return;
+      }
+      const normalizedKey = decrypted.startsWith("0x") ? decrypted : `0x${decrypted}`;
+      this.agentWallets.set(agentIdStr, new ethers.Wallet(normalizedKey, this.provider));
+      console.log(`[PlatformDispatcher] Loaded wallet key for Agent ${agentIdStr} from Supabase (auto-discover)`);
+    } catch (err) {
+      console.warn(`[PlatformDispatcher] Wallet key fetch failed for Agent ${agentIdStr}: ${err.message}`);
+    }
+  }
+
+  /**
    * Loads and validates capability manifests for the given agent IDs.
    */
   async _loadAgentConfigs(agentIds) {
     for (const agentId of agentIds) {
       try {
         await this._loadAgentConfig(agentId);
+        await this._loadWalletKeyForAgent(agentId);
       } catch (error) {
         console.error(`[PlatformDispatcher] Failed to load config for Agent ${agentId}:`, error.message);
       }
@@ -805,6 +841,11 @@ export class PlatformDispatcher {
       const k = process.env.AGENT_PRIVATE_KEY.startsWith("0x")
         ? process.env.AGENT_PRIVATE_KEY
         : `0x${process.env.AGENT_PRIVATE_KEY}`;
+      // Skip placeholder values
+      if (k.includes("your_") || k.includes("placeholder") || k.includes("<UNKNOWN>")) {
+        console.warn(`[PlatformDispatcher] AGENT_PRIVATE_KEY contains placeholder — no signer for Agent ${agentIdStr}`);
+        return null;
+      }
       signer = new ethers.Wallet(k, this.provider);
     }
     return signer || null;
@@ -1181,6 +1222,7 @@ Respond with STRICT JSON ONLY (no markdown fences, no prose):
       console.log(`[PlatformDispatcher] Config not ready for Agent ${agentIdStr} — loading on demand...`);
       try {
         await this._loadAgentConfig(agentIdStr);
+        await this._loadWalletKeyForAgent(agentIdStr);
         config = this.agentConfigs.get(agentIdStr);
       } catch (err) {
         console.error(`[PlatformDispatcher] On-demand config load failed for Agent ${agentIdStr}:`, err.message);
@@ -1201,11 +1243,15 @@ Respond with STRICT JSON ONLY (no markdown fences, no prose):
       const fallbackKey = process.env.AGENT_PRIVATE_KEY.startsWith("0x")
         ? process.env.AGENT_PRIVATE_KEY
         : `0x${process.env.AGENT_PRIVATE_KEY}`;
-      agentSigner = new ethers.Wallet(fallbackKey, this.provider);
-      console.log(`[PlatformDispatcher] Using AGENT_PRIVATE_KEY fallback signer for Agent ${agentIdStr}: ${agentSigner.address}`);
+      if (!fallbackKey.includes("your_") && !fallbackKey.includes("placeholder") && !fallbackKey.includes("<UNKNOWN>")) {
+        agentSigner = new ethers.Wallet(fallbackKey, this.provider);
+        console.log(`[PlatformDispatcher] Using AGENT_PRIVATE_KEY fallback signer for Agent ${agentIdStr}: ${agentSigner.address}`);
+      } else {
+        console.warn(`[PlatformDispatcher] AGENT_PRIVATE_KEY is placeholder — skipping fallback for Agent ${agentIdStr}`);
+      }
     }
     if (!agentSigner) {
-      console.error(`[PlatformDispatcher] No agentWallet key for Agent ${agentIdStr} — releaseMilestone WILL revert (NotAgentWallet). Set AGENT_WALLET_KEYS in .env.`);
+      console.error(`[PlatformDispatcher] No agentWallet key for Agent ${agentIdStr} — releaseMilestone WILL revert (NotAgentWallet). Register agent with encrypted wallet key.`);
       agentSigner = this.wallet; // fall back to platform wallet, but it will fail at release time
     }
 
