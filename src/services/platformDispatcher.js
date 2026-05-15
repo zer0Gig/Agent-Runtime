@@ -95,7 +95,7 @@ async function fetchManifestFromSupabase(agentId) {
     );
     if (!res.ok) return null;
     const rows = await res.json();
-    return rows?.[0] ?? null;
+    return rows?.[0]?.metadata ?? null;
   } catch {
     return null;
   }
