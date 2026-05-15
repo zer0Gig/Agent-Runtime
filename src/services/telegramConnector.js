@@ -220,11 +220,20 @@ function getBot() {
     // Polling mode — bot.launch() returns a promise that rejects on fatal errors (e.g. 409 conflict)
     _bot.launch({ dropPendingUpdates: false }).catch((err) => {
       if (err?.response?.error_code === 409) {
-        console.warn("[Telegram] 409 Conflict — another instance is polling this token. Stopping duplicate.");
+        console.warn("[Telegram] 409 Conflict — another instance is polling this token. Will retry in 30s...");
+        // Don't nullify _bot — schedule a retry so the bot recovers after the conflict clears
+        setTimeout(() => {
+          if (_bot) {
+            console.log("[Telegram] Retrying polling after 409 conflict...");
+            _bot.launch({ dropPendingUpdates: true }).catch((retryErr) => {
+              console.error(`[Telegram] Retry failed: ${retryErr.message}`);
+            });
+          }
+        }, 30_000);
       } else {
         console.error(`[Telegram] Polling error: ${err.message}`);
+        _bot = null;
       }
-      _bot = null;
     });
     console.log("[Telegram] Polling mode (dev).");
   }
