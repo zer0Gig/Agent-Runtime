@@ -106,7 +106,7 @@ async function main() {
   console.log(`[Platform] Balance:           ${ethers.formatEther(balance)} OG`);
   console.log(`[Platform] Block:             ${blockNumber}`);
   console.log(`[Platform] Managed Agents:    ${managedIds.length > 0 ? managedIds.join(", ") : "(auto-discover)"}`);
-  console.log(`[Platform] Agent Wallet Keys: ${Object.keys(agentWalletKeys).length > 0 ? Object.keys(agentWalletKeys).join(", ") : (process.env.AGENT_PRIVATE_KEY ? "(single via AGENT_PRIVATE_KEY)" : "(NONE — releaseMilestone will revert)")}`);
+  console.log(`[Platform] Agent Wallet Keys: ${Object.keys(agentWalletKeys).length > 0 ? Object.keys(agentWalletKeys).join(", ") : "(NONE — agents must register with encrypted wallet keys in Supabase)"}`);
   console.log(`[Platform] ProgressiveEscrow: ${process.env.PROGRESSIVE_ESCROW_ADDRESS}`);
   console.log(`[Platform] SubscriptionEscrow:${process.env.SUBSCRIPTION_ESCROW_ADDRESS || "(fallback to ProgressiveEscrow)"}`);
   console.log();
@@ -198,7 +198,7 @@ function startHealthCheck(port = parseInt(process.env.PORT || "10000"), dispatch
           hasSupabase: !!process.env.SUPABASE_URL,
           hasPlatformKey: !!process.env.PLATFORM_PRIVATE_KEY,
           hasEncryptionKey: !!process.env.PLATFORM_ENCRYPTION_PRIVATE_KEY,
-          hasAgentPrivateKey: !!process.env.AGENT_PRIVATE_KEY,
+          hasAgentWalletsLoaded: this.dispatcher.agentWallets.size,
           hasAgentWalletKeys: !!process.env.AGENT_WALLET_KEYS,
           hasTelegramToken: !!process.env.TELEGRAM_BOT_TOKEN,
           rpcUrl: process.env.OG_NEWTON_RPC || "default",

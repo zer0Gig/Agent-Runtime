@@ -836,19 +836,7 @@ export class PlatformDispatcher {
    * msg.sender == agentWallet (drainPerCheckIn, drainPerAlert, updateInterval).
    */
   _resolveAgentSigner(agentIdStr) {
-    let signer = this.agentWallets.get(agentIdStr);
-    if (!signer && process.env.AGENT_PRIVATE_KEY) {
-      const k = process.env.AGENT_PRIVATE_KEY.startsWith("0x")
-        ? process.env.AGENT_PRIVATE_KEY
-        : `0x${process.env.AGENT_PRIVATE_KEY}`;
-      // Skip placeholder values
-      if (k.includes("your_") || k.includes("placeholder") || k.includes("<UNKNOWN>")) {
-        console.warn(`[PlatformDispatcher] AGENT_PRIVATE_KEY contains placeholder — no signer for Agent ${agentIdStr}`);
-        return null;
-      }
-      signer = new ethers.Wallet(k, this.provider);
-    }
-    return signer || null;
+    return this.agentWallets.get(agentIdStr) || null;
   }
 
   /**
@@ -1237,21 +1225,10 @@ Respond with STRICT JSON ONLY (no markdown fences, no prose):
     console.log(`[PlatformDispatcher] Routing Job ${jobId} to Agent ${agentIdStr} using provider: ${config.platformConfig?.llmProvider || "0g-compute"}`);
 
     // Resolve the agent's signer for releaseMilestone. Contract requires msg.sender == job.agentWallet.
-    // Lookup order: per-agent map → AGENT_PRIVATE_KEY (single-agent fallback) → platform wallet (will revert).
+    // Agent wallet keys are loaded dynamically from Supabase (ECIES-encrypted, auto-decrypted at startup).
     let agentSigner = this.agentWallets.get(agentIdStr);
-    if (!agentSigner && process.env.AGENT_PRIVATE_KEY) {
-      const fallbackKey = process.env.AGENT_PRIVATE_KEY.startsWith("0x")
-        ? process.env.AGENT_PRIVATE_KEY
-        : `0x${process.env.AGENT_PRIVATE_KEY}`;
-      if (!fallbackKey.includes("your_") && !fallbackKey.includes("placeholder") && !fallbackKey.includes("<UNKNOWN>")) {
-        agentSigner = new ethers.Wallet(fallbackKey, this.provider);
-        console.log(`[PlatformDispatcher] Using AGENT_PRIVATE_KEY fallback signer for Agent ${agentIdStr}: ${agentSigner.address}`);
-      } else {
-        console.warn(`[PlatformDispatcher] AGENT_PRIVATE_KEY is placeholder — skipping fallback for Agent ${agentIdStr}`);
-      }
-    }
     if (!agentSigner) {
-      console.error(`[PlatformDispatcher] No agentWallet key for Agent ${agentIdStr} — releaseMilestone WILL revert (NotAgentWallet). Register agent with encrypted wallet key.`);
+      console.error(`[PlatformDispatcher] No agentWallet key for Agent ${agentIdStr} — releaseMilestone WILL revert (NotAgentWallet). Register agent with encrypted wallet key in Supabase.`);
       agentSigner = this.wallet; // fall back to platform wallet, but it will fail at release time
     }
 

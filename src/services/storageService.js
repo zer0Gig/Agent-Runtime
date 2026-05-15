@@ -11,6 +11,15 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { keccak256, toUtf8Bytes, encodeBase64 } from "ethers";
 
+/**
+ * JSON replacer that converts BigInt values to strings.
+ * Prevents "Do not know how to serialize a BigInt" errors when
+ * uploading blockchain data (block numbers, balances, etc.) to 0G Storage.
+ */
+function bigintReplacer(_key, value) {
+  return typeof value === "bigint" ? value.toString() : value;
+}
+
 const INDEXER_RPC =
   process.env.OG_INDEXER_RPC ||
   "https://indexer-storage-testnet-turbo.0g.ai";
@@ -438,7 +447,7 @@ export class StorageService {
     const filePath = join(this.tmpDir, filename);
 
     // Write data to temp file
-    const content = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+    const content = typeof data === "string" ? data : JSON.stringify(data, bigintReplacer, 2);
     writeFileSync(filePath, content, "utf-8");
 
     console.log(`[Storage] Uploading ${filename} (${content.length} bytes)...`);

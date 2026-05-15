@@ -35,9 +35,7 @@ async function main() {
 
   // ── Validate config ──────────────────────────────────────────
   const requiredEnv = [
-    "AGENT_PRIVATE_KEY",
     "PROGRESSIVE_ESCROW_ADDRESS",
-    "AGENT_ID",
   ];
   for (const key of requiredEnv) {
     if (!process.env[key]) {
@@ -54,60 +52,61 @@ async function main() {
   // ── Setup provider & wallet ──────────────────────────────────
   const rpcUrl = process.env.OG_NEWTON_RPC || "https://evmrpc-testnet.0g.ai";
   const provider = new ethers.JsonRpcProvider(rpcUrl);
-  const wallet = new ethers.Wallet(process.env.AGENT_PRIVATE_KEY, provider);
+  // Platform wallet — used for reading chain state and platform-level operations.
+  // Agent-specific signing uses dynamically loaded wallet keys from Supabase (ECIES).
+  let wallet;
+  if (process.env.PLATFORM_PRIVATE_KEY) {
+    wallet = new ethers.Wallet(process.env.PLATFORM_PRIVATE_KEY, provider);
+  } else {
+    // Read-only mode — no platform wallet. Agent operations still work via dynamic keys.
+    wallet = null;
+    console.log("[Runtime] PLATFORM_PRIVATE_KEY not set — running in read-only mode for platform operations.");
+  }
 
-  const blockNumber = await provider.getBlockNumber();
-  const balance = await provider.getBalance(wallet.address);
+  if (wallet) {
+    const blockNumber = await provider.getBlockNumber();
+    const balance = await provider.getBalance(wallet.address);
 
-  console.log(`[Runtime] Chain RPC:     ${rpcUrl}`);
-  console.log(`[Runtime] Agent Wallet:  ${wallet.address}`);
-  console.log(`[Runtime] Balance:       ${ethers.formatEther(balance)} OG`);
-  console.log(`[Runtime] Block:         ${blockNumber}`);
-  console.log(`[Runtime] Agent ID:      ${process.env.AGENT_ID}`);
+    console.log(`[Runtime] Chain RPC:     ${rpcUrl}`);
+    console.log(`[Runtime] Platform Wallet: ${wallet.address}`);
+    console.log(`[Runtime] Balance:       ${ethers.formatEther(balance)} OG`);
+    console.log(`[Runtime] Block:         ${blockNumber}`);
+  } else {
+    console.log(`[Runtime] Chain RPC:     ${rpcUrl}`);
+    console.log(`[Runtime] Platform Wallet: (read-only mode)`);
+  }
   console.log();
 
   // ── Initialize 0G Services ──────────────────────────────────
   console.log("[Runtime] Initializing 0G services...\n");
 
-  // 0G Compute — Decentralized LLM inference
-  const compute = new ComputeService(wallet);
-
-  // 0G Storage — Decentralized file storage
-  const storage = new StorageService(wallet);
+  // 0G Storage — Decentralized file storage (needs signer for uploads)
+  const storage = wallet ? new StorageService(wallet) : null;
 
   // State Manager — Orchestrates checkpoint persistence
-  const stateManager = new StateManager(storage);
-  stateManager.startBackgroundSync();
+  if (storage) {
+    const stateManager = new StateManager(storage);
+    stateManager.startBackgroundSync();
 
-  // Process Exit Handlers for StateManager
-  const shutdown = async () => {
-    console.log("\n[Runtime] Shutting down... syncing pending state.");
-    await stateManager.forceSync();
-    process.exit(0);
-  };
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
-
-  // Job Processor — Orchestrates task execution
-  const processor = new JobProcessor({
-    wallet,
-    computeService: compute,
-    storageService: storage,
-    escrowAddress: process.env.PROGRESSIVE_ESCROW_ADDRESS,
-    alignmentVerifierKey: process.env.ALIGNMENT_VERIFIER_KEY || process.env.AGENT_PRIVATE_KEY,
-  });
-
-  console.log(`[Runtime] Alignment Score: ${Number(process.env.DEMO_ALIGNMENT_SCORE) || 8500} (Threshold: 8000)`);
+    // Process Exit Handlers for StateManager
+    const shutdown = async () => {
+      console.log("\n[Runtime] Shutting down... syncing pending state.");
+      await stateManager.forceSync();
+      process.exit(0);
+    };
+    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
+  }
 
   // Alert Delivery System — Handles real-time notifications
   const alertDelivery = new AlertDelivery({
-    wallet,
-    escrowAddress: process.env.SUBSCRIPTION_ESCROW_ADDRESS || process.env.PROGRESSIVE_ESCROW_ADDRESS, // Fallback
+    wallet: wallet || provider,
+    escrowAddress: process.env.SUBSCRIPTION_ESCROW_ADDRESS || process.env.PROGRESSIVE_ESCROW_ADDRESS,
     storageService: storage,
   });
 
-// Agent Scheduler — Handles recurring subscription jobs
-const scheduler = new AgentScheduler({ alertDelivery, storageService: storage });
+  // Agent Scheduler — Handles recurring subscription jobs
+  const scheduler = new AgentScheduler({ alertDelivery, storageService: storage });
 
   // ── Listen for blockchain events ─────────────────────────────
   const progressiveEscrowAddress = process.env.PROGRESSIVE_ESCROW_ADDRESS;
@@ -127,8 +126,10 @@ const scheduler = new AgentScheduler({ alertDelivery, storageService: storage })
     "event SubscriptionCancelled(uint256 indexed subscriptionId, string reason, uint256 refund)",
   ];
   
-  // BUG-2 FIX: Use wallet (signer) instead of provider for state-changing transactions
-  const subscriptionEscrow = new ethers.Contract(subscriptionEscrowAddress, SUBSCRIPTION_ESCROW_ABI, wallet);
+  // BUG-2 FIX: Use wallet (signer) for state-changing transactions, or provider for read-only
+  const subscriptionEscrow = wallet
+    ? new ethers.Contract(subscriptionEscrowAddress, SUBSCRIPTION_ESCROW_ABI, wallet)
+    : new ethers.Contract(subscriptionEscrowAddress, SUBSCRIPTION_ESCROW_ABI, provider);
 
   console.log(`[Runtime] Listening for events on ProgressiveEscrow: ${progressiveEscrowAddress}`);
   console.log(`[Runtime] SubscriptionEscrow: ${subscriptionEscrowAddress}`);

@@ -247,22 +247,18 @@ Reply with only "APPROVED" or "REVISION: ..." — nothing else.`,
           `Understood — I'll revise: "${details}". This is revision ${revisions}/${MAX_REVISIONS}.`
         );
 
-        if (revisions >= MAX_REVISIONS) {
-          await postChat(
-            jobId,
-            `I've done my best with ${revisions} revision(s). If you'd like further changes after approving, you can open a new job. Please click the button to proceed when ready.`,
-            "milestone_ready",
-            { milestoneIndex }
-          );
-        } else {
-          // Re-post card after acknowledging revision
-          await postChat(
-            jobId,
-            `Revision applied. Please review again — click below when satisfied.`,
-            "milestone_ready",
-            { milestoneIndex }
-          );
+        // Return revision details so processMilestone can re-execute the milestone
+        if (revisions <= MAX_REVISIONS) {
+          return { userFeedback: details, path: "revision", revisionDetails: details, revisionCount: revisions };
         }
+
+        // Max revisions reached — post card and wait for approval
+        await postChat(
+          jobId,
+          `I've done my best with ${revisions} revision(s). If you'd like further changes after approving, you can open a new job. Please click the button to proceed when ready.`,
+          "milestone_ready",
+          { milestoneIndex }
+        );
       }
 
       continue; // restart poll loop
