@@ -14,6 +14,29 @@ import { ethers } from "ethers";
 import { PlatformDispatcher } from "./services/platformDispatcher.js";
 import { initTelegram, getBotStatus } from "./services/telegramConnector.js";
 
+// ── In-memory log buffer (circular, last 2000 entries) ──────────────────────
+const LOG_BUFFER = [];
+const LOG_MAX = 2000;
+const _origLog = console.log;
+const _origWarn = console.warn;
+const _origError = console.error;
+const _origInfo = console.info;
+
+function _pushLog(level, args) {
+  const entry = {
+    ts: new Date().toISOString(),
+    level,
+    msg: args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" "),
+  };
+  LOG_BUFFER.push(entry);
+  if (LOG_BUFFER.length > LOG_MAX) LOG_BUFFER.shift();
+}
+
+console.log = (...args) => { _pushLog("info", args); _origLog.apply(console, args); };
+console.warn = (...args) => { _pushLog("warn", args); _origWarn.apply(console, args); };
+console.error = (...args) => { _pushLog("error", args); _origError.apply(console, args); };
+console.info = (...args) => { _pushLog("info", args); _origInfo.apply(console, args); };
+
 async function main() {
   console.log("╔══════════════════════════════════════════════════╗");
   console.log("║  zer0Gig Platform Dispatcher (Path B)            ║");
@@ -184,18 +207,27 @@ function startHealthCheck(port = parseInt(process.env.PORT || "10000"), dispatch
       return;
     }
 
-    // Recent logs endpoint — returns last N log entries from memory
+    // Recent logs endpoint — returns in-memory log buffer
     if (req.url && req.url.startsWith("/debug/logs") && req.method === "GET") {
       const url = new URL(req.url, `http://${req.headers.host}`);
-      const limit = parseInt(url.searchParams.get("limit") || "50");
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "100"), 500);
       const level = url.searchParams.get("level") || null;
       const search = url.searchParams.get("q") || null;
-      // Collect recent console output from a simple in-memory buffer
+
+      let logs = LOG_BUFFER.slice(-limit);
+      if (level) logs = logs.filter(l => l.level === level);
+      if (search) {
+        const re = new RegExp(search, "i");
+        logs = logs.filter(l => re.test(l.msg));
+      }
+
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status: "ok",
-        note: "For full logs, use Railway dashboard. This endpoint returns runtime state only.",
-        tip: "Check /debug/status for agent/wallet/scheduler state.",
+        total: LOG_BUFFER.length,
+        returned: logs.length,
+        filter: { level, search, limit },
+        logs,
       }, null, 2));
       return;
     }
