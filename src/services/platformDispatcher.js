@@ -287,6 +287,9 @@ export class PlatformDispatcher {
 
     // Recover existing subscriptions from on-chain
     await this._recoverSubscriptions();
+
+    // Recover unprocessed jobs from on-chain (events emitted before this runtime started)
+    await this._recoverJobs();
   }
 
   /**
@@ -317,9 +320,13 @@ export class PlatformDispatcher {
         const metadata = await fetchManifestFromSupabase(i);
         if (metadata?.platformManaged === true) {
           newAgents.push(agentIdStr);
+        } else if (metadata) {
+          console.log(`[PlatformDispatcher] Agent #${agentIdStr} found but platformManaged=${metadata.platformManaged} — skipping`);
+        } else {
+          console.log(`[PlatformDispatcher] Agent #${agentIdStr} has no metadata in Supabase — skipping`);
         }
       } catch (err) {
-        // skip
+        console.warn(`[PlatformDispatcher] Agent #${agentIdStr} Supabase fetch failed: ${err.message?.slice(0, 80)}`);
       }
     }
 
@@ -411,6 +418,56 @@ export class PlatformDispatcher {
       console.log(`[PlatformDispatcher] Recovery complete. Recovered ${recovered} subscription(s).`);
     } catch (err) {
       console.error(`[PlatformDispatcher] Failed to scan subscriptions: ${err.message}`);
+    }
+  }
+
+  /**
+   * Recovers unprocessed jobs from on-chain events emitted before this runtime started.
+   * Scans all ProposalAccepted + MilestoneDefined events for managed agents.
+   */
+  async _recoverJobs() {
+    console.log("[PlatformDispatcher] Recovering unprocessed jobs from on-chain...");
+
+    const escrowContract = new ethers.Contract(
+      this.escrowAddress,
+      PROGRESSIVE_ESCROW_ABI,
+      this.provider
+    );
+
+    try {
+      // Scan MilestoneDefined events from the last 50,000 blocks (~14 days on 0G testnet)
+      const currentBlock = await this.provider.getBlockNumber();
+      const fromBlock = Math.max(1, currentBlock - 50_000);
+
+      const milestones = await escrowContract.queryFilter("MilestoneDefined", fromBlock, currentBlock);
+      console.log(`[PlatformDispatcher] Found ${milestones.length} MilestoneDefined event(s) in range [${fromBlock}..${currentBlock}]`);
+
+      let recovered = 0;
+      for (const event of milestones) {
+        try {
+          const jobId = Number(event.args?.jobId ?? event.args?.[0]);
+          if (!jobId) continue;
+
+          const job = await escrowContract.getJob(jobId);
+          const agentIdStr = job[1].toString(); // agentId at index 1
+
+          if (!this.managedAgentIds.has(agentIdStr)) continue;
+
+          // Check job status — only process jobs that are still active (status 1 = Posted, 2 = Accepted, 3 = InProgress)
+          const status = Number(job[2]);
+          if (status >= 4) continue; // 4=Completed, 5=Cancelled, 6=Disputed — skip
+
+          console.log(`[PlatformDispatcher] Recovering Job ${jobId} (Agent ${agentIdStr}, status=${status})`);
+          await this.routeJob(jobId, job, agentIdStr);
+          recovered++;
+        } catch (err) {
+          console.warn(`[PlatformDispatcher] Failed to recover job from event: ${err.message?.slice(0, 80)}`);
+        }
+      }
+
+      console.log(`[PlatformDispatcher] Job recovery complete. Recovered ${recovered} job(s).`);
+    } catch (err) {
+      console.error(`[PlatformDispatcher] Failed to scan for jobs: ${err.message}`);
     }
   }
 
