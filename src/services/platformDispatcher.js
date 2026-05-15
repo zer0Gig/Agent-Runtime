@@ -150,6 +150,8 @@ export class PlatformDispatcher {
     this._runningBotTokens = new Set();
     // Block-polling event watchers (replace ethers .on() filters which 0G RPC drops)
     this._eventWatchers = [];
+    // Cached ExtendedComputeService per agentId (prevent memory leak from creating new instances every tick)
+    this.computeServices = new Map();
   }
 
   /**
@@ -893,11 +895,16 @@ export class PlatformDispatcher {
       }
     }
 
-    const compute = new ExtendedComputeService(agentSigner || this.wallet, {
-      provider: config.platformConfig?.llmProvider || "0g-compute",
-      model:    config.platformConfig?.model,
-      systemPrompt: config.platformConfig?.systemPrompt || "You are an autonomous monitoring agent on the zer0Gig platform. You have access to tools — use their results to inform your decision.",
-    });
+    // Cache ExtendedComputeService per agentId to prevent memory leak
+    let compute = this.computeServices.get(agentIdStr);
+    if (!compute) {
+      compute = new ExtendedComputeService(agentSigner || this.wallet, {
+        provider: config.platformConfig?.llmProvider || "0g-compute",
+        model:    config.platformConfig?.model,
+        systemPrompt: config.platformConfig?.systemPrompt || "You are an autonomous monitoring agent on the zer0Gig platform. You have access to tools — use their results to inform your decision.",
+      });
+      this.computeServices.set(agentIdStr, compute);
+    }
 
     const toolsList = [
       ...customTools.map(t => `${t.name || t.type} (${t.type})`),

@@ -6,6 +6,7 @@ class AgentScheduler {
     this.storage = storageService; // Store storage service instance
     this.alertDelivery = alertDelivery;
     this._listeners = new Map();
+    this.runningJobs = new Set(); // Track concurrently executing jobs (prevent overlapping ticks)
   }
 
   on(event, fn) {
@@ -26,14 +27,27 @@ class AgentScheduler {
    * @param {object} config - Job config (subscriptionId, agentId, etc.)
    */
   async scheduleJob(jobId, intervalCron, taskFn, config = {}) {
+    // Stop existing cron for this jobId to prevent duplicate schedules
+    const existing = this.jobs.get(jobId);
+    if (existing) {
+      existing.cronJob.stop();
+      console.log(`[Scheduler] Stopped existing cron for ${jobId} before re-schedule`);
+    }
+
     // Create cron job
     const cronJob = cron.schedule(intervalCron, async () => {
+      // Skip if this job is already running (prevent overlapping ticks)
+      if (this.runningJobs.has(jobId)) {
+        console.log(`[Scheduler] Job ${jobId} still running — skipping overlapping tick`);
+        return;
+      }
+
+      this.runningJobs.add(jobId);
       console.log(`[Scheduler] Executing job ${jobId}...`);
       
       try {
-        // CRITICAL FIX (HIGH-1): Read checkpoint FRESH each tick, not at setup
-        // Use instance method from storageService
-        const checkpoint = await this.storage?.readCheckpoint(jobId) || null;
+        // Read checkpoint FRESH each tick; default {} to prevent null-spread crash
+        const checkpoint = await this.storage?.readCheckpoint(jobId) || {};
         
         // Execute task with fresh checkpoint
         const result = await taskFn(checkpoint);
@@ -52,14 +66,16 @@ class AgentScheduler {
         
       } catch (error) {
         console.error(`[Scheduler] Job ${jobId} failed:`, error);
-        // Read current checkpoint to preserve existing state
-        const checkpoint = await this.storage?.readCheckpoint(jobId) || null;
+        // Read current checkpoint to preserve existing state; default {} not null
+        const checkpoint = await this.storage?.readCheckpoint(jobId) || {};
         // Save error state
         await this.storage?.saveCheckpoint(jobId, {
           ...checkpoint,
           lastError: error.message,
           errorTimestamp: Date.now(),
         });
+      } finally {
+        this.runningJobs.delete(jobId);
       }
     }, {
       scheduled: true,

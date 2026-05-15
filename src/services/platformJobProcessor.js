@@ -41,6 +41,7 @@ async function postChat(jobId, message, msgType = "text", metadata = {}) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ jobId, sender: "agent", message, msgType, metadata }),
+      signal: AbortSignal.timeout(8_000),
     });
   } catch (err) {
     console.log(`[PlatformProcessor] postChat error: ${err.message}`);
@@ -107,7 +108,9 @@ export async function runFeedbackLoop(
     while (Date.now() - graceStart < ALIGNMENT_GRACE_MS) {
       await new Promise(r => setTimeout(r, 1_000));
       try {
-        const res = await fetch(`${ACTIVITY_BASE}/api/job-chat?jobId=${jobId}&since=${encodeURIComponent(startMsgTime)}`);
+        const res = await fetch(`${ACTIVITY_BASE}/api/job-chat?jobId=${jobId}&since=${encodeURIComponent(startMsgTime)}`, {
+          signal: AbortSignal.timeout(8_000),
+        });
         if (res.ok) {
           const all = await res.json();
           const userMessages = all.filter(m => m.sender === "user");
@@ -167,7 +170,7 @@ export async function runFeedbackLoop(
 
     // ── Check if user already clicked the approval button ──────────────────
     try {
-      const res = await fetch(approvalUrl);
+      const res = await fetch(approvalUrl, { signal: AbortSignal.timeout(8_000) });
       if (res.ok && (await res.json()).approved) {
         console.log(`[PlatformProcessor] Milestone ${milestoneIndex + 1} approved via button.`);
         return { userFeedback: collectedFeedback.join("\n") };
@@ -177,7 +180,9 @@ export async function runFeedbackLoop(
     // ── Fetch new user chat messages since last check ───────────────────────
     let userMessages = [];
     try {
-      const res = await fetch(`${ACTIVITY_BASE}/api/job-chat?jobId=${jobId}&since=${encodeURIComponent(lastMsgTime)}`);
+      const res = await fetch(`${ACTIVITY_BASE}/api/job-chat?jobId=${jobId}&since=${encodeURIComponent(lastMsgTime)}`, {
+        signal: AbortSignal.timeout(8_000),
+      });
       if (res.ok) {
         const all = await res.json();
         userMessages = all.filter(m => m.sender === "user");
@@ -365,7 +370,9 @@ export class PlatformJobProcessor extends JobProcessor {
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, POLL_INTERVAL));
       try {
-        const res = await fetch(`${ACTIVITY_BASE}/api/job-chat?jobId=${jobId}&since=${encodeURIComponent(lastMsgTime)}`);
+        const res = await fetch(`${ACTIVITY_BASE}/api/job-chat?jobId=${jobId}&since=${encodeURIComponent(lastMsgTime)}`, {
+          signal: AbortSignal.timeout(8_000),
+        });
         if (!res.ok) continue;
         const msgs = (await res.json()).filter(m => m.sender === "user");
         if (!msgs.length) continue;
