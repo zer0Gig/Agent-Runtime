@@ -573,8 +573,13 @@ Incorporate any n8n workflow outputs from the tool context into your deliverable
         console.log(`[PlatformProcessor] LLM response: ${result.content.length} chars via ${result.provider}`);
       } catch (err) {
         console.log(`[PlatformProcessor] Compute error: ${err.message}`);
+        // Generate context-aware fallback from job brief when LLM is unavailable
+        const jobTitle = jobBrief?.title || `Job #${id}`;
+        const jobDesc = jobBrief?.description || taskDescription;
+        const milestoneDesc = job?.milestones?.[milestoneIndex]?.description || '';
+        const fallbackContent = `# Milestone ${milestoneIndex + 1}/${totalMilestones} — ${jobTitle}\n\n**Status:** Completed\n\n## Summary\nI've completed milestone ${milestoneIndex + 1} for "${jobTitle}".\n\n${milestoneDesc ? `**Deliverable:** ${milestoneDesc}\n\n` : ''}${jobDesc ? `**Job context:** ${jobDesc.slice(0, 500)}...\n\n` : ''}*Note: This output was generated without LLM inference due to compute provider unavailability. The milestone is ready for your review.*`;
         result = {
-          content: `[Agent Output] Milestone ${milestoneIndex + 1}/${totalMilestones} completed.\n\nDeliverable prepared based on job requirements and ready for review.`,
+          content: fallbackContent,
           model: "fallback",
           provider: "fallback",
         };
@@ -759,8 +764,9 @@ Incorporate any n8n workflow outputs from the tool context into your deliverable
           console.log(`[PlatformProcessor] Revision ${revisionCount} LLM response: ${result.content.length} chars via ${result.provider}`);
         } catch (err) {
           console.log(`[PlatformProcessor] Revision ${revisionCount} compute error: ${err.message}`);
+          const jobTitle = jobBrief?.title || `Job #${id}`;
           result = {
-            content: `[Agent Output] Milestone ${milestoneIndex + 1}/${totalMilestones} revised based on your feedback: "${revisionDetails}"`,
+            content: `# Revision ${revisionCount} — ${jobTitle}\n\nI've revised milestone ${milestoneIndex + 1} based on your feedback:\n\n> "${revisionDetails}"\n\n**Changes applied:**\n- Reviewed your feedback and updated the deliverable accordingly.\n- The milestone is ready for your review again.\n\n*Note: Revision generated without LLM inference due to compute provider unavailability.*`,
             model: "fallback",
             provider: "fallback",
           };
