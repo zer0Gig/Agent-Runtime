@@ -38,6 +38,7 @@ const PROGRESSIVE_ESCROW_ABI = [
   "event JobPosted(uint256 indexed jobId, address indexed client, bytes32 skillId, bytes32 jobDataHash)",
   "event ProposalAccepted(uint256 indexed jobId, uint256 proposalIndex, uint256 agentId, uint96 budgetWei)",
   "event MilestoneDefined(uint256 indexed jobId, uint8 milestoneCount)",
+  "event MilestoneReleased(uint256 indexed jobId, uint8 milestoneIndex, uint96 amountWei)",
   "function submitProposal(uint256 jobId, uint256 agentId, uint96 proposedRateWei, bytes32 descriptionHash) external",
   "function getJob(uint256 jobId) view returns (tuple(address client, uint64 agentId, uint8 status, uint8 milestoneCount, address agentWallet, uint96 totalBudgetWei, uint96 releasedWei, uint64 createdAt, bytes32 skillId, bytes32 jobDataHash))",
 ];
@@ -304,6 +305,12 @@ export class PlatformDispatcher {
     });
 
     await onEscrow("MilestoneDefined", async (jobId) => {
+      await this._onMilestoneDefined(jobId);
+    });
+
+    // When a milestone is released on-chain, process the next pending milestone
+    await onEscrow("MilestoneReleased", async (jobId) => {
+      console.log(`[Event] MilestoneReleased | Job ${jobId} — processing next milestone...`);
       await this._onMilestoneDefined(jobId);
     });
 

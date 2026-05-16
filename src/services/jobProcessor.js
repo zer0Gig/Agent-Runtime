@@ -189,7 +189,11 @@ export class JobProcessor {
         });
       }
 
-      // 3. Process each pending milestone
+      // 3. Process the FIRST pending milestone only.
+      // Subsequent milestones are processed when the dispatcher detects a
+      // MilestoneReleased event and re-calls processJob. This ensures we
+      // NEVER advance to the next milestone until the previous one is
+      // actually approved and released on-chain.
       for (let i = 0; i < milestones.length; i++) {
         const milestone = milestones[i];
 
@@ -199,7 +203,13 @@ export class JobProcessor {
           continue;
         }
 
+        console.log(`[Processor] Processing first pending milestone ${i} — will wait for on-chain approval before continuing.`);
         await this.processMilestone(jobId, i, job, jobBrief);
+
+        // After processing one milestone, exit. The dispatcher will re-trigger
+        // processJob when it detects the MilestoneReleased event on-chain.
+        console.log(`[Processor] Milestone ${i} processed — waiting for on-chain release before next.`);
+        break;
       }
 
       // After all milestones: commit full activity log bundle + record portfolio entry
