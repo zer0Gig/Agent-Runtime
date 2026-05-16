@@ -86,6 +86,7 @@ export class ComputeService {
 
   /**
    * Send a chat completion request to a 0G Compute provider
+   * Retries up to 3 times on transient BigInt errors from the SDK.
    */
   async chatCompletion(messages, options = {}) {
     await this.initialize();
@@ -109,55 +110,67 @@ export class ComputeService {
       userContent
     );
 
-    // Call OpenAI-compatible endpoint. We need both the parsed body AND the
-    // raw response — `processResponse` requires the `ZG-Res-Key` header value
-    // (per 0G team confirmation, May 2026), NOT the OpenAI `chatcmpl-...` id.
-    // Using completion.id silently fails with `chat_id_not_found` on Galileo.
-    const openai = new OpenAI({ baseURL: endpoint, apiKey: "" });
-    const { data: completion, response } = await openai.chat.completions
-      .create(
-        {
-          model,
-          messages,
-          max_tokens: options.maxTokens || 2048,
-          temperature: options.temperature || 0.7,
-        },
-        { headers }
-      )
-      .withResponse();
-
-    const content = completion.choices[0]?.message?.content || "";
-
-    // Pull the verification key. Header names are case-insensitive in HTTP/1.1
-    // but Node fetch normalizes to lowercase; check both for safety.
-    const zgResKey =
-      response.headers.get("zg-res-key") ||
-      response.headers.get("ZG-Res-Key") ||
-      null;
-
-    // Verify response (TEE verification + payment settlement)
-    if (zgResKey) {
+    // Retry on transient BigInt errors from the 0G SDK
+    const MAX_RETRIES = 3;
+    let lastErr;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        const isValid = await this.broker.inference.processResponse(
-          providerAddress,
-          zgResKey,
-          content
-        );
-        console.log(`[Compute] Response verified via ZG-Res-Key: ${isValid}`);
-      } catch (err) {
-        console.log(`[Compute] Verification failed: ${err.message?.slice(0, 100)}`);
-      }
-    } else {
-      console.warn("[Compute] ZG-Res-Key header missing from provider response — skipping TEE verification");
-    }
+        // Call OpenAI-compatible endpoint
+        const openai = new OpenAI({ baseURL: endpoint, apiKey: "" });
+        const { data: completion, response } = await openai.chat.completions
+          .create(
+            {
+              model,
+              messages,
+              max_tokens: options.maxTokens || 2048,
+              temperature: options.temperature || 0.7,
+            },
+            { headers }
+          )
+          .withResponse();
 
-    return {
-      content,
-      model,
-      provider: providerAddress,
-      completionId: completion.id,
-      zgResKey,
-    };
+        const content = completion.choices[0]?.message?.content || "";
+
+        // Pull the verification key
+        const zgResKey =
+          response.headers.get("zg-res-key") ||
+          response.headers.get("ZG-Res-Key") ||
+          null;
+
+        // Verify response (TEE verification + payment settlement)
+        if (zgResKey) {
+          try {
+            const isValid = await this.broker.inference.processResponse(
+              providerAddress,
+              zgResKey,
+              content
+            );
+            console.log(`[Compute] Response verified via ZG-Res-Key: ${isValid}`);
+          } catch (err) {
+            console.log(`[Compute] Verification failed: ${err.message?.slice(0, 100)}`);
+          }
+        } else {
+          console.warn("[Compute] ZG-Res-Key header missing from provider response — skipping TEE verification");
+        }
+
+        return {
+          content,
+          model,
+          provider: providerAddress,
+          completionId: completion.id,
+          zgResKey,
+        };
+      } catch (err) {
+        lastErr = err;
+        if (err.message?.includes("BigInt") && attempt < MAX_RETRIES) {
+          console.log(`[Compute] BigInt error (attempt ${attempt}/${MAX_RETRIES}) — retrying...`);
+          await new Promise(r => setTimeout(r, 1000 * attempt));
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastErr;
   }
 
   /**
