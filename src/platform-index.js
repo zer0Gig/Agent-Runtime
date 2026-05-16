@@ -139,6 +139,21 @@ async function main() {
     process.exit(1);
   }
 
+  // ── Auto-Recovery: scan on-chain events every 10 minutes ─────
+  // Catches missed JobCreated/MilestoneDefined events that rotated out
+  // of the event watcher buffer, or jobs that crashed before completion.
+  const RECOVERY_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+  console.log(`[Platform] Auto-recovery scheduled every ${RECOVERY_INTERVAL_MS / 60000} minutes`);
+  setInterval(async () => {
+    try {
+      console.log("[Platform] Auto-recovery: scanning on-chain events...");
+      await dispatcher._recoverJobs();
+      await dispatcher._recoverSubscriptions();
+    } catch (err) {
+      console.warn(`[Platform] Auto-recovery failed: ${err.message}`);
+    }
+  }, RECOVERY_INTERVAL_MS);
+
   // ── Graceful Shutdown ────────────────────────────────────────
   const shutdown = async (signal) => {
     console.log(`\n[Platform] ${signal} received — shutting down...`);
