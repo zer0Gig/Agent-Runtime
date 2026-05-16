@@ -29,15 +29,21 @@ export class ComputeService {
     this.broker = await createZGComputeNetworkBroker(this.wallet);
 
     // Check if ledger exists, create if not
-    // Use a small deposit — testnet inference costs fractions of OG per request
     const ledgerDeposit = Number(process.env.OG_COMPUTE_LEDGER_DEPOSIT) || 0.002;
     try {
       const ledger = await this.broker.ledger.getLedger();
       console.log("[Compute] Ledger found. Balance:", ledger.balance?.toString());
     } catch {
-      console.log(`[Compute] No ledger found. Creating with ${ledgerDeposit} OG deposit...`);
-      await this.broker.ledger.addLedger(ledgerDeposit);
-      console.log("[Compute] Ledger created.");
+      console.log(`[Compute] No ledger found. Attempting to create with ${ledgerDeposit} OG deposit...`);
+      try {
+        await this.broker.ledger.addLedger(ledgerDeposit);
+        console.log("[Compute] Ledger created.");
+      } catch (ledgerErr) {
+        // 0G SDK has BigInt serialization bugs in addLedger — the transaction
+        // may still succeed on-chain even if the SDK throws. Mark initialized
+        // and let inference calls proceed; getLedger will find it next time.
+        console.warn(`[Compute] addLedger SDK error: ${ledgerErr.message} — continuing anyway (ledger may exist on-chain)`);
+      }
     }
 
     this.initialized = true;
