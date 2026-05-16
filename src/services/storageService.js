@@ -315,6 +315,13 @@ export class StorageService {
       console.log(`[KV Node] Wrote ${streamIdString}/${keyString} (tx=${tx?.txHash?.slice(0, 10) || "?"}...)`);
       return true;
     } catch (err) {
+      // 0G SDK KV batcher has internal BigInt serialization bugs — treat as
+      // non-fatal so the circuit breaker doesn't open unnecessarily.
+      if (err.message?.includes("BigInt")) {
+        console.warn(`[KV Node] SDK BigInt error on ${streamIdString}/${keyString} — skipping KV Node write, Supabase fallback still active`);
+        this._kvNodeRecordFailure(err.message);
+        return false;
+      }
       console.warn(`[KV Node] Write failed for ${streamIdString}/${keyString} after retries: ${err.message}`);
       this._kvNodeRecordFailure(err.message);
       return false;
