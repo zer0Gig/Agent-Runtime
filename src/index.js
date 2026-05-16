@@ -1,3 +1,16 @@
+// ── BigInt toJSON polyfill ─────────────────────────────────────────────────
+// 0G Compute SDK and ethers v6 internally call JSON.stringify on objects
+// containing BigInt (wei amounts, block numbers, gas prices). Without this
+// polyfill, the SDK's error formatter crashes with "Do not know how to
+// serialize a BigInt" — even when the on-chain tx actually succeeded.
+// Must be placed BEFORE any other import to patch the prototype early.
+if (!("toJSON" in BigInt.prototype)) {
+  Object.defineProperty(BigInt.prototype, "toJSON", {
+    value: function () { return this.toString(); },
+    writable: false, configurable: false, enumerable: false,
+  });
+}
+
 /**
  * zer0Gig — Agent Runtime
  *
